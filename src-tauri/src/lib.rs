@@ -18,14 +18,17 @@ pub fn run() {
             Some(locales::idioma_del_sistema()),
             locales::directorio(),
         ))
-        .plugin(tauri_plugin_config_manager::init())
         .plugin(tauri_plugin_shell::init());
 
-    // Los iconos del tema sólo en escritorio: `vicons` arrastra `gtk`, que no
-    // existe en Android/iOS. En un teléfono no hay tema freedesktop que resolver.
+    // Plugins sólo de escritorio: sus crates no compilan para Android (ver
+    // `Cargo.toml`). `vicons` arrastra `gtk`, y `config-manager` 2.13 usa su
+    // módulo `desktop` sin condicionar por plataforma. En móvil el esquema de
+    // color sale del piso de `main.css` hasta que el pareo traiga el de la PC.
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
-        builder = builder.plugin(tauri_plugin_vicons::init());
+        builder = builder
+            .plugin(tauri_plugin_config_manager::init())
+            .plugin(tauri_plugin_vicons::init());
     }
 
     builder
