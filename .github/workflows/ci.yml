@@ -1,0 +1,61 @@
+# Los chequeos viven en el repositorio `.github` de la organización, así que
+# acá sólo se los llama. Cambiarlos es cambiarlos en un solo lugar.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  app:
+    # Sólo lectura. Estos chequeos clonan, instalan dependencias y comprueban:
+    # no comentan, no etiquetan, no publican.
+    #
+    # El workflow llamado declara lo mismo en su trabajo, que es donde el
+    # permiso se aplica; esto lo escribe también acá porque el análisis
+    # estático de este repositorio no puede ver el otro archivo, y ahí un
+    # trabajo sin `permissions` se lee como permisos por omisión.
+    permissions:
+      contents: read
+    uses: Vasak-OS/.github/.github/workflows/app.yml@main
+    # Sólo el token de SonarQube Cloud, y por nombre: `secrets: inherit`
+    # le daría también el de crates.io y el de npm a un trabajo que
+    # instala dependencias de terceros.
+    secrets:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+    with:
+      # El guardia de bibliotecas propias corta acá en vez de sólo avisar.
+      #
+      # En la plantilla importa el doble que en cualquier otro repositorio: esto
+      # se copia con cada aplicación nueva, así que la que nazca de acá nace ya
+      # con el corte encendido y no puede quedarse atrás en silencio — que es
+      # exactamente como se quedaron las diecisiete en la 0.7 de la librería,
+      # durante ocho versiones y sin que nada fallara.
+      bibliotecas_cortan: true
+      # Y el candado también. La línea de arriba decía «ya está al día» siendo
+      # falso: el rango pedía `^1.0.0` —que admite la 1.4.0— y `bun.lock` se
+      # había quedado en la 1.0.0, así que se empaquetaba ésa con el CI en
+      # verde. Ahora que la comprobación existe (Vasak-OS/.github#7), se
+      # enciende acá. Para este repositorio es **la** protección: no usa ningún
+      # componente que haya cambiado, así que lo único que puede pasarle es
+      # quedarse atrás otra vez sin que nada lo diga.
+      candado_corta: true
+      # Las pruebas de Rust corren en `revisar` y de esa misma corrida sale la
+      # cobertura que se le pasa a Sonar. Sin esto las pruebas no corrían en
+      # ningún PR, y un PR que sólo toca Rust pasaba la puerta sin medir nada
+      # (Vasak-OS/.github#25).
+      # La plantilla: lo que esté acá lo heredan las aplicaciones nuevas.
+      pruebas_rust: -p vapp
+      # Lo que pide el grafo en Linux, mirado con `cargo tree -i`:
+      #
+      #   libwebkit2gtk-4.1-dev  webkit2gtk, gtk3 (que trae wayland-client),
+      #                          soup3 y `dbus-1`, que pide `libdbus-sys` por
+      #                          `tao`
+      #   lld                    `src-tauri/.cargo/config.toml` enlaza con
+      #                          `-fuse-ld=lld`, y la imagen del runner no lo trae
+      #   build-essential        el compilador de C de los `-sys`
+      paquetes_rust: >-
+        libwebkit2gtk-4.1-dev
+        lld
+        build-essential
