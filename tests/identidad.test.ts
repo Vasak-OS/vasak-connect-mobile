@@ -12,9 +12,13 @@
  * con una expresión por sección, sin traer una dependencia para esto.
  */
 
+import { fileURLToPath } from 'node:url';
 import { describe, expect, test } from 'bun:test';
 
-const RAIZ = new URL('..', import.meta.url).pathname;
+// `fileURLToPath` y no `.pathname`: un checkout con un espacio en la ruta
+// (`/tmp/mobile app/`) deja `.pathname` con `%20` y las lecturas de manifiesto
+// buscan un archivo que no existe.
+const RAIZ = fileURLToPath(new URL('..', import.meta.url));
 
 const paquete = await Bun.file(`${RAIZ}package.json`).json();
 const tauri = await Bun.file(`${RAIZ}src-tauri/tauri.conf.json`).json();

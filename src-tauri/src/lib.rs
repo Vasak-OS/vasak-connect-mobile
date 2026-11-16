@@ -7,7 +7,8 @@ mod locales;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    #[allow(unused_mut)]
+    let mut builder = tauri::Builder::default()
         // El idioma de la sesión. **Con la ruta explícita de los catálogos**:
         // el plugin sólo prueba rutas relativas al ejecutable y al directorio
         // de trabajo, y ninguna existe cuando el binario está en /usr/bin. Sin
@@ -18,8 +19,16 @@ pub fn run() {
             locales::directorio(),
         ))
         .plugin(tauri_plugin_config_manager::init())
-        .plugin(tauri_plugin_vicons::init())
-        .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_shell::init());
+
+    // Los iconos del tema sólo en escritorio: `vicons` arrastra `gtk`, que no
+    // existe en Android/iOS. En un teléfono no hay tema freedesktop que resolver.
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        builder = builder.plugin(tauri_plugin_vicons::init());
+    }
+
+    builder
         .run(tauri::generate_context!())
         .expect("error al ejecutar la aplicación");
 }

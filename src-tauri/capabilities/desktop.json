@@ -1,0 +1,12 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "desktop",
+  "description": "Permisos sólo de escritorio: los iconos del tema (vicons) arrastran gtk y no van a móvil.",
+  "platforms": ["linux", "macOS", "windows"],
+  "windows": [
+    "main"
+  ],
+  "permissions": [
+    "vicons:default"
+  ]
+}
