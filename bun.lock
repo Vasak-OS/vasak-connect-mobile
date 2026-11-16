@@ -3,15 +3,13 @@
   "configVersion": 0,
   "workspaces": {
     "": {
-      "name": "vapp",
+      "name": "vasak-connect-mobile",
       "dependencies": {
         "@tailwindcss/vite": "^4.3.3",
         "@tauri-apps/api": "^2.12.2",
         "@tauri-apps/plugin-shell": "^2.4.1",
         "@vasakgroup/plugin-config-manager": "^2.13.0",
         "@vasakgroup/plugin-vicons": "^2.2.2",
-        "@vasakgroup/plugin-vsk-contextual-menu": "^2.0.3",
-        "@vasakgroup/plugin-vsk-journal": "^2.0.1",
         "@vasakgroup/tauri-plugin-i18n": "^2.3.1",
         "@vasakgroup/vue-libvasak": "^2.22.0",
         "pinia": "^3.0.4",
@@ -177,10 +175,6 @@
     "@vasakgroup/plugin-config-manager": ["@vasakgroup/plugin-config-manager@2.13.0", "", { "peerDependencies": { "@tauri-apps/api": "^2.11.0", "pinia": "^3.0.4 || ^4.0.0", "vue": "^3.5.35" } }, "sha512-ph3AR2ddczrP5Q+axTBX5QAnTo6GhKqw9qHv+vM7txHgZ1ESf/jeXMWwyVfIn9/yG8OMJIt/s2m/PY5ZwJawAQ=="],
 
     "@vasakgroup/plugin-vicons": ["@vasakgroup/plugin-vicons@2.2.2", "", { "dependencies": { "@tauri-apps/api": "^2.11.0" } }, "sha512-Y5cSlXCzbV1tKp3+451r8ekTuhXG4jkH+nwofrdbM+kAcy3XCxlTpMiE/4ugkEG1xH7K2+gQTni79I8EYqC3qw=="],
-
-    "@vasakgroup/plugin-vsk-contextual-menu": ["@vasakgroup/plugin-vsk-contextual-menu@2.0.3", "", { "dependencies": { "@tauri-apps/api": "^2.11.0" }, "peerDependencies": { "vue": "^3.0.0" }, "optionalPeers": ["vue"] }, "sha512-f/6WQ30QasZGuQx5MDlHfP5DlGC0/EACpuSZy2bKy2UkbGSxO8xO7YnQuzx5jdWYlpXVWFj/oDRC1Mk3FUjegg=="],
-
-    "@vasakgroup/plugin-vsk-journal": ["@vasakgroup/plugin-vsk-journal@2.0.1", "", { "dependencies": { "@tauri-apps/api": "^2.11.0" } }, "sha512-rHdhG/xkRzb7tYj5T28vGOWzLfmvz2LrCB906WlDWlnIwVC+cnLIdDz5I28VHad778s5eB4zhMgsiazRLVh8ZQ=="],
 
     "@vasakgroup/tauri-plugin-i18n": ["@vasakgroup/tauri-plugin-i18n@2.3.1", "", { "dependencies": { "@tauri-apps/api": "^2.10.1" }, "peerDependencies": { "vue": "^3.0.0" }, "optionalPeers": ["vue"] }, "sha512-UZogtGKZFSy2Ok2hkXn5oAOuXGSeKbCKC/+HzHwuGMQi5Q42l+/+vyTx+sFcr0R0ffhewctUSQePED+17sUJpg=="],
 

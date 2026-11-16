@@ -9,13 +9,9 @@ _version: 1
 #  2. Los dos idiomas tienen que tener las **mismas claves** y los mismos
 #     marcadores `{0}`. Hay un test que lo verifica.
 app:
-  nombre: Aplicación Vasak
-ventana:
-  minimizar: Minimizar
-  maximizar: Maximizar
-  cerrar: Cerrar
+  nombre: Vasak Connect
 inicio:
-  titulo: Hola, VasakOS
-  descripcion: Esta es la plantilla. Reemplazá esta pantalla por la tuya.
-  # `t()` no interpola: el marcador se reemplaza a mano. Ver el README.
-  saludo: "Hola, {0}"
+  titulo: Vasak Connect
+  descripcion: El compañero móvil de tu escritorio VasakOS. El vínculo con tu equipo llega en una próxima versión.
+  estado:
+    sinVincular: Sin vincular
