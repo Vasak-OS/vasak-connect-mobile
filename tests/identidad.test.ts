@@ -31,12 +31,16 @@ function campoDeSeccion(texto: string, seccion: string, campo: string): string |
 }
 
 describe('la identidad de los manifiestos', () => {
-	test('las tres versiones coinciden y valen 0.1.0', () => {
+	test('las tres versiones coinciden entre sí y son semver', () => {
+		// Lo que importa es que los tres cuenten la MISMA versión; el valor exacto
+		// no se fija acá para no tener que tocar este test en cada bump (lo que el
+		// CI de versión ya cuida es justo esta coincidencia). Sí se exige que sea
+		// un semver, para atrapar un manifiesto con la versión vacía o rota.
 		const versionCargo = campoDeSeccion(cargoTexto, 'package', 'version');
 
-		expect(paquete.version).toBe('0.1.0');
-		expect(versionCargo).toBe('0.1.0');
-		expect(tauri.version).toBe('0.1.0');
+		expect(paquete.version).toMatch(/^\d+\.\d+\.\d+$/);
+		expect(versionCargo).toBe(paquete.version);
+		expect(tauri.version).toBe(paquete.version);
 	});
 
 	test('el package.json se llama vasak-connect-mobile', () => {

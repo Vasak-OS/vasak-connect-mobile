@@ -6,3 +6,11 @@ inicio:
   descripcion: The mobile companion for your VasakOS desktop. Pairing with your computer arrives in a future release.
   estado:
     sinVincular: Not paired
+  descubiertos:
+    titulo: Desktops on your network
+    buscando: Looking for VasakOS desktops…
+  tipo:
+    phone: Phone
+    tablet: Tablet
+    desktop: Desktop
+    unknown: Device

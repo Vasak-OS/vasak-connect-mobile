@@ -14,7 +14,7 @@
 
 import { describe, expect, test } from 'bun:test';
 import { EmptyState } from '@vasakgroup/vue-libvasak';
-import { mount } from '@vue/test-utils';
+import { flushPromises, mount } from '@vue/test-utils';
 import WelcomeScreen from '../src/views/WelcomeScreen.vue';
 
 describe('la pantalla de bienvenida', () => {
@@ -32,5 +32,18 @@ describe('la pantalla de bienvenida', () => {
 		expect(texto).toContain('inicio.titulo');
 		expect(texto).toContain('inicio.descripcion');
 		expect(texto).toContain('inicio.estado.sinVincular');
+	});
+
+	test('muestra la sección de descubiertos buscando mientras no hay escritorios', async () => {
+		// El `invoke` del arnés no devuelve escritorios, así que la lista arranca
+		// vacía: la sección tiene que mostrar su título y el texto de «buscando»,
+		// no romperse ni quedar en blanco. Se espera a que el `onMounted` asiente
+		// (`flushPromises`) para leer el estado de verdad, no sólo el primer dibujo.
+		const wrapper = mount(WelcomeScreen);
+		await flushPromises();
+		const texto = wrapper.text();
+
+		expect(texto).toContain('inicio.descubiertos.titulo');
+		expect(texto).toContain('inicio.descubiertos.buscando');
 	});
 });
