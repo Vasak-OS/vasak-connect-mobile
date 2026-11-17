@@ -39,7 +39,7 @@ interface PairedPeer {
 /** Cómo terminó un pareo, igual que `PairingResultPayload` de Rust. */
 interface PairingResult {
 	device_id: string;
-	status: 'paired' | 'rejected_local' | 'rejected_peer' | 'aborted' | 'error';
+	status: 'paired' | 'rejected_local' | 'rejected_peer' | 'aborted' | 'cancelled' | 'error';
 	message: string | null;
 }
 
@@ -97,6 +97,16 @@ async function confirm(accept: boolean): Promise<void> {
 	}
 }
 
+/** Cancela el pareo en curso (sobre todo mientras conecta, cuando no hay SAS que
+ * rechazar). El cartel de resultado llega por el evento `pairing-result`. */
+async function cancel(): Promise<void> {
+	try {
+		await invoke('pair_cancel');
+	} catch (error) {
+		console.error('No se pudo cancelar el pareo', error);
+	}
+}
+
 onMounted(async () => {
 	try {
 		await escuchar<Peer[]>('peers-changed', (payload) => {
@@ -130,6 +140,12 @@ onMounted(async () => {
 		await refreshPaired();
 	} catch (error) {
 		console.error('No se pudo iniciar el descubrimiento', error);
+		// Si el arranque falló a mitad, soltar los oyentes que sí se registraron:
+		// no dejarlos activos para un componente que no terminó de montar. `splice`
+		// los saca de la lista para que el desmontaje no los suelte de nuevo.
+		for (const un of unlistens.splice(0)) {
+			un();
+		}
 	}
 });
 
@@ -220,11 +236,15 @@ onUnmounted(() => {
           {{ t('inicio.sas.titulo') }}
         </h2>
 
-        <p
-          v-if="pairing.sas === null"
-          class="py-4 text-center text-tx-muted">
-          {{ t('inicio.sas.conectando') }}
-        </p>
+        <template v-if="pairing.sas === null">
+          <p class="py-4 text-center text-tx-muted">{{ t('inicio.sas.conectando') }}</p>
+          <button
+            type="button"
+            class="w-full rounded-corner-m bg-ui-surface px-4 py-2 text-sm font-medium text-tx-main shadow-surface-s transition-opacity hover:opacity-90"
+            @click="cancel">
+            {{ t('inicio.sas.cancelar') }}
+          </button>
+        </template>
 
         <template v-else>
           <p class="text-center text-sm text-tx-muted">{{ t('inicio.sas.instruccion') }}</p>

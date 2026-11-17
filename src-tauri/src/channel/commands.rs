@@ -131,6 +131,7 @@ fn release_pairing(state: &State<'_, ChannelState>) {
     if let Ok(mut inner) = state.inner.lock() {
         inner.pairing_active = false;
         inner.pending_confirm = None;
+        inner.pairing_task = None;
     }
 }
 
@@ -152,9 +153,12 @@ async fn pair_request(
     state: State<'_, ChannelState>,
     device_id: String,
 ) -> Result<(), String> {
-    let addr = {
+    let (addr, expected_fingerprint) = {
         let inner = state.inner.lock().map_err(|_| "estado envenenado")?;
-        inner.peers.get(&device_id).map(|d| d.addr)
+        inner
+            .peers
+            .get(&device_id)
+            .map(|d| (d.addr, d.peer.fingerprint.clone()))
     }
     .ok_or("ese escritorio ya no está en la lista")?;
 
@@ -210,11 +214,18 @@ async fn pair_request(
         }
     };
     let app_task = app.clone();
-    tauri::async_runtime::spawn(async move {
+    let task = tauri::async_runtime::spawn(async move {
         // Con tope de tiempo: un par que nunca completa no bloquea el canal (C10).
         let outcome = match tokio::time::timeout(
             PAIRING_TIMEOUT,
-            pair_session(addr, identity, own, sas_tx, confirm_rx),
+            pair_session(
+                addr,
+                expected_fingerprint,
+                identity,
+                own,
+                sas_tx,
+                confirm_rx,
+            ),
         )
         .await
         {
@@ -226,7 +237,35 @@ async fn pair_request(
         let _ = forwarder.await;
         finish_pairing(&app_task, &dir, &device_id, outcome).await;
     });
+    // Guardar el handle para poder cancelar el intento (`pair_cancel`).
+    if let Ok(mut inner) = state.inner.lock() {
+        inner.pairing_task = Some(task);
+    }
 
+    Ok(())
+}
+
+/// Cancela el pareo en curso: aborta la tarea, libera el guardia y avisa a la
+/// interfaz. Para cuando la persona cierra el diálogo mientras se conecta —antes de
+/// que haya un SAS que rechazar—. No falla si no hay nada que cancelar.
+#[tauri::command]
+fn pair_cancel(app: AppHandle, state: State<'_, ChannelState>) -> Result<(), String> {
+    let task = {
+        let mut inner = state.inner.lock().map_err(|_| "estado envenenado")?;
+        inner.pairing_task.take()
+    };
+    if let Some(task) = task {
+        task.abort();
+    }
+    release_pairing(&state);
+    let _ = app.emit(
+        PAIRING_RESULT,
+        PairingResultPayload {
+            device_id: String::new(),
+            status: "cancelled",
+            message: None,
+        },
+    );
     Ok(())
 }
 
@@ -234,6 +273,7 @@ async fn pair_request(
 /// pareo sobre los canales que las conectan.
 async fn pair_session(
     addr: SocketAddr,
+    expected_fingerprint: String,
     identity: Arc<Identity>,
     own: PeerInfo,
     sas_tx: mpsc::UnboundedSender<String>,
@@ -243,6 +283,15 @@ async fn pair_session(
         .await
         .map_err(|e| e.to_string())?;
     let peer_fingerprint = session.peer_fingerprint().to_string();
+    // La huella del certificado TLS tiene que ser la que el escritorio anunció por
+    // mDNS. Si no, se abandona el pareo: el `device_id` que se guardaría (derivado
+    // del certificado) no casaría con el de la fila descubierta, y un par que
+    // anuncia una huella y presenta otra no es con quien la persona quiso vincular.
+    // La seguridad del pareo la da igual el SAS; esto corta antes y mantiene
+    // coherente descubrimiento↔pareo↔almacén.
+    if peer_fingerprint != expected_fingerprint {
+        return Err("el certificado del escritorio no coincide con el que anunció".to_string());
+    }
     let (read_half, write_half) = session.split();
 
     let (in_tx, in_rx) = mpsc::channel::<Result<Message, SessionError>>(16);
@@ -263,13 +312,9 @@ async fn finish_pairing(
     device_id: &str,
     outcome: Result<pairing::Outcome, String>,
 ) {
-    if let Some(state) = app.try_state::<ChannelState>() {
-        if let Ok(mut inner) = state.inner.lock() {
-            inner.pairing_active = false;
-            inner.pending_confirm = None;
-        }
-    }
-
+    // Persistir (si se fijó) y emitir el resultado ANTES de liberar el guardia: así
+    // un pareo nuevo no puede empezar durante la persistencia/emisión, ni el
+    // resultado de éste cerrar el diálogo de otro que arrancó en el medio.
     let payload = match outcome {
         Ok(pairing::Outcome::Paired(peer)) => {
             let message = store::add(dir, peer).await.err().map(|e| e.to_string());
@@ -303,6 +348,14 @@ async fn finish_pairing(
         },
     };
     let _ = app.emit(PAIRING_RESULT, payload);
+
+    if let Some(state) = app.try_state::<ChannelState>() {
+        if let Ok(mut inner) = state.inner.lock() {
+            inner.pairing_active = false;
+            inner.pending_confirm = None;
+            inner.pairing_task = None;
+        }
+    }
 }
 
 /// La decisión de la persona sobre el SAS en curso. Falla si no hay un pareo
@@ -339,6 +392,7 @@ pub fn init(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wry> {
             discovered_peers,
             pair_request,
             pair_confirm,
+            pair_cancel,
             paired_peers
         ])
 }

@@ -23,9 +23,11 @@ inicio:
     instruccion: Check that this code matches the one shown on the desktop.
     aceptar: They match
     rechazar: They differ
+    cancelar: Cancel
   resultado:
     paired: Desktop paired.
-    rejected_local: You cancelled pairing.
+    rejected_local: You rejected the code.
     rejected_peer: The desktop rejected pairing.
     aborted: Pairing was interrupted for safety. Try again.
+    cancelled: Pairing cancelled.
     error: Pairing could not be completed.

@@ -78,6 +78,10 @@ struct Inner {
     /// El canal por el que `pair_confirm` le pasa la decisión de la persona al
     /// pareo en curso. `Some` sólo mientras hay un pareo esperando confirmación.
     pending_confirm: Option<oneshot::Sender<bool>>,
+    /// La tarea del pareo en curso, para poder cancelarla (`pair_cancel`): mientras
+    /// se conecta no hay SAS que rechazar, así que la cancelación es la única salida
+    /// de la persona antes del tope de tiempo.
+    pairing_task: Option<tauri::async_runtime::JoinHandle<()>>,
 }
 
 impl Inner {

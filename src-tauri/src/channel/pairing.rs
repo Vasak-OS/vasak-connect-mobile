@@ -347,7 +347,10 @@ mod tests {
                 .send(Ok(Message::PairResponse { accepted: true }))
                 .await
                 .unwrap();
-            // Mantener vivo `to_run_tx` hasta acá; al salir se suelta.
+            // Devolver `to_run_tx` en vez de soltarlo: el canal tiene que seguir
+            // abierto hasta que `run` llegue a fijar. Si se soltara acá, `run` podría
+            // ver el cierre antes de la confirmación local y abortar (flake).
+            to_run_tx
         });
 
         // La persona confirma recién cuando se muestra el SAS.
@@ -359,7 +362,8 @@ mod tests {
         let outcome = run(desk_fp, &phone, to_run_rx, from_run_tx, sas_tx, confirm_rx)
             .await
             .unwrap();
-        responder.await.unwrap();
+        // Recién ahora se suelta el canal del respondedor (vivía en el JoinHandle).
+        let _held = responder.await.unwrap();
         confirmer.await.unwrap();
 
         match outcome {
