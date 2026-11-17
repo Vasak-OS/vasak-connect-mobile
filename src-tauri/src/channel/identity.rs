@@ -1,0 +1,169 @@
+//! La identidad TLS de larga vida del teléfono.
+//!
+//! Un certificado autofirmado con su clave privada, como el del daemon: no lo
+//! valida ninguna CA, la seguridad la da el *pinning* de la huella en el pareo.
+//! En el escritorio la clave vive en el Secret Service (`vasak-keyring`); en el
+//! teléfono no hay Secret Service ni `~/.config`, así que la clave y el
+//! certificado van al directorio de datos **privado** de la app (sandbox
+//! por-app, que Android/iOS aíslan de las demás).
+//!
+//! shortcut: clave en un archivo del dir privado, protegida sólo por el sandbox
+//! de la app. El endurecimiento es moverla al Android Keystore / iOS Keychain
+//! (hardware-backed); va cuando el pareo esté andando en dispositivo.
+//!
+//! El cálculo de la huella y del `device_id` sale de
+//! [`vasak_connect_protocol::pure`], la misma del daemon; acá sólo se genera el
+//! par y se lo guarda.
+
+use std::path::Path;
+
+use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use vasak_connect_protocol::pure::{device_id_from_fingerprint, fingerprint_from_der};
+use zeroize::Zeroizing;
+
+/// El nombre de los archivos dentro del dir privado de la app.
+const CERT_FILE: &str = "connect-cert.der";
+const KEY_FILE: &str = "connect-key.der";
+
+/// La identidad cargada: lo que necesita rustls (certificado y clave) más la
+/// huella y el `device_id` que se derivan del certificado.
+pub struct Identity {
+    pub cert_der: CertificateDer<'static>,
+    pub key_der: PrivateKeyDer<'static>,
+    /// SHA-256 del DER del certificado, con dos puntos, como en
+    /// [`vasak_connect_protocol::wire::PeerInfo::fingerprint`].
+    pub fingerprint: String,
+    /// Identificador estable derivado de la huella.
+    pub device_id: String,
+}
+
+impl Identity {
+    /// Arma la identidad desde el certificado y la clave en DER, derivando la
+    /// huella y el `device_id`. No toca disco. La clave llega envuelta en
+    /// [`Zeroizing`] para que esa copia intermedia se borre al salir.
+    fn from_parts(cert_der: Vec<u8>, key_pkcs8_der: Zeroizing<Vec<u8>>) -> Self {
+        let fingerprint = fingerprint_from_der(&cert_der);
+        let device_id = device_id_from_fingerprint(&fingerprint);
+        Identity {
+            cert_der: CertificateDer::from(cert_der),
+            key_der: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pkcs8_der.to_vec())),
+            fingerprint,
+            device_id,
+        }
+    }
+}
+
+/// Errores al cargar o crear la identidad. Ninguno hace entrar en pánico.
+#[derive(Debug)]
+pub enum IdentityError {
+    Generate(rcgen::Error),
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for IdentityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            IdentityError::Generate(err) => write!(f, "no se pudo generar el certificado: {err}"),
+            IdentityError::Io(err) => write!(f, "identidad en disco: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for IdentityError {}
+
+/// Genera un par nuevo: certificado y clave en DER. La clave es ECDSA P-256 (el
+/// valor por omisión de `rcgen`), que el proveedor `ring` de rustls firma. El
+/// único SAN no se usa —no hay validación de nombre—, está sólo para que el
+/// certificado sea bien formado.
+fn generate() -> Result<(Vec<u8>, Zeroizing<Vec<u8>>), rcgen::Error> {
+    let certified = rcgen::generate_simple_self_signed(vec!["vasak-connect-mobile".to_string()])?;
+    let cert_der = certified.cert.der().to_vec();
+    let key_der = Zeroizing::new(certified.signing_key.serialize_der());
+    Ok((cert_der, key_der))
+}
+
+/// Carga la identidad del dir dado, o la crea y la guarda si falta.
+///
+/// Usa los dos archivos sólo si **los dos** están; si falta cualquiera, genera un
+/// par nuevo y lo persiste. Al guardar escribe la clave **antes** que el
+/// certificado: si se corta en el medio, la próxima vez falta el certificado y se
+/// regenera todo —nunca queda una clave de una generación con el certificado de
+/// otra, que haría fallar el TLS siempre—.
+pub async fn load_or_create(dir: &Path) -> Result<Identity, IdentityError> {
+    let cert_path = dir.join(CERT_FILE);
+    let key_path = dir.join(KEY_FILE);
+
+    if let (Ok(cert), Ok(key)) = (
+        tokio::fs::read(&cert_path).await,
+        tokio::fs::read(&key_path).await,
+    ) {
+        if !cert.is_empty() && !key.is_empty() {
+            return Ok(Identity::from_parts(cert, Zeroizing::new(key)));
+        }
+    }
+
+    let (cert_der, key_der) = generate().map_err(IdentityError::Generate)?;
+    tokio::fs::create_dir_all(dir)
+        .await
+        .map_err(IdentityError::Io)?;
+    tokio::fs::write(&key_path, &key_der[..])
+        .await
+        .map_err(IdentityError::Io)?;
+    tokio::fs::write(&cert_path, &cert_der)
+        .await
+        .map_err(IdentityError::Io)?;
+    Ok(Identity::from_parts(cert_der, key_der))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn la_identidad_generada_deriva_huella_e_id_del_certificado() {
+        let (cert, key) = generate().unwrap();
+        let identity = Identity::from_parts(cert.clone(), key);
+        assert_eq!(identity.fingerprint, fingerprint_from_der(&cert));
+        assert_eq!(
+            identity.device_id,
+            device_id_from_fingerprint(&identity.fingerprint)
+        );
+        assert_eq!(identity.cert_der.as_ref(), cert.as_slice());
+        assert!(matches!(identity.key_der, PrivateKeyDer::Pkcs8(_)));
+    }
+
+    #[test]
+    fn dos_identidades_generadas_no_comparten_huella() {
+        let (a, _) = generate().unwrap();
+        let (b, _) = generate().unwrap();
+        assert_ne!(fingerprint_from_der(&a), fingerprint_from_der(&b));
+    }
+
+    #[tokio::test]
+    async fn crea_y_despues_carga_la_misma_identidad() {
+        let dir = std::env::temp_dir().join(format!("vcm-id-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+
+        let creada = load_or_create(&dir).await.unwrap();
+        let cargada = load_or_create(&dir).await.unwrap();
+        // La segunda vez lee los archivos, no regenera: misma huella y device_id.
+        assert_eq!(creada.fingerprint, cargada.fingerprint);
+        assert_eq!(creada.device_id, cargada.device_id);
+
+        tokio::fs::remove_dir_all(&dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn si_falta_el_certificado_regenera_el_par() {
+        let dir = std::env::temp_dir().join(format!("vcm-id-regen-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+
+        let primera = load_or_create(&dir).await.unwrap();
+        // Simula un corte entre escribir la clave y el certificado.
+        tokio::fs::remove_file(dir.join(CERT_FILE)).await.unwrap();
+        let segunda = load_or_create(&dir).await.unwrap();
+        assert_ne!(primera.fingerprint, segunda.fingerprint);
+
+        tokio::fs::remove_dir_all(&dir).await.unwrap();
+    }
+}

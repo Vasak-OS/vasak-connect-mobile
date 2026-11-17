@@ -2,20 +2,22 @@
 /**
  * La primera pantalla de Vasak Connect.
  *
- * Da la bienvenida y **lista los escritorios de VasakOS que aparecen en la red**
- * (descubrimiento por mDNS, del lado de Rust). Todavía no parea: el botón de
- * vincular y el SAS llegan en el PR siguiente. Todo lo que dibuja sale de
- * `@vasakgroup/vue-libvasak` y de los tokens del sistema —colores, radios y
- * sombras del esquema de VasakOS (decisión 8 del taller)—; nada de paletas
- * propias ni de la de Tailwind.
+ * Lista los escritorios de VasakOS que aparecen en la red (descubrimiento por
+ * mDNS) y deja **vincular** con uno: abre el pareo, muestra el código de
+ * seguridad (SAS) que el escritorio también muestra, y fija el vínculo sólo si la
+ * persona confirma que los dos códigos coinciden. Todo el I/O y la cripto están
+ * del lado de Rust; acá sólo se dispara y se sigue por eventos.
  *
- * No hay marco de ventana: en un teléfono la ventana la gobierna el sistema.
+ * Lo que dibuja sale de `@vasakgroup/vue-libvasak` y de los tokens del sistema
+ * —colores, radios y sombras del esquema de VasakOS (decisión 8)—; nada de
+ * paletas propias ni de la de Tailwind. No hay marco de ventana: en un teléfono
+ * la gobierna el sistema.
  */
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { useI18n } from '@vasakgroup/tauri-plugin-i18n';
 import { EmptyState, StatusDot } from '@vasakgroup/vue-libvasak';
-import { onMounted, onUnmounted, ref } from 'vue';
+import { computed, onMounted, onUnmounted, ref } from 'vue';
 
 /** Lo que anuncia un escritorio, igual que `PeerInfo` del contrato (`wire`). */
 interface Peer {
@@ -26,58 +28,103 @@ interface Peer {
 	fingerprint: string;
 }
 
+/** Un escritorio ya vinculado (persistido del lado de Rust). */
+interface PairedPeer {
+	device_id: string;
+	name: string;
+	kind: Peer['kind'];
+	fingerprint: string;
+}
+
+/** Cómo terminó un pareo, igual que `PairingResultPayload` de Rust. */
+interface PairingResult {
+	device_id: string;
+	status: 'paired' | 'rejected_local' | 'rejected_peer' | 'aborted' | 'error';
+	message: string | null;
+}
+
 const { t } = useI18n();
 
 const peers = ref<Peer[]>([]);
-let unlisten: UnlistenFn | null = null;
-// Si el componente se desmonta mientras el `listen`/`invoke` de arranque siguen
-// pendientes, hay que soltar lo que llegue tarde. Sin esto, un `listen` que
-// resuelve después del desmontaje deja el oyente colgado para siempre y arranca
-// un descubrimiento sin componente que lo gobierne.
+const paired = ref<PairedPeer[]>([]);
+/** El pareo en curso: el escritorio elegido y el SAS cuando llega (`null` hasta). */
+const pairing = ref<{ deviceId: string; name: string; sas: string | null } | null>(null);
+/** El último resultado, para un cartel breve. */
+const result = ref<PairingResult | null>(null);
+
+const pairedIds = computed(() => new Set(paired.value.map((p) => p.device_id)));
+
 let disposed = false;
+const unlistens: UnlistenFn[] = [];
+
+async function refreshPaired(): Promise<void> {
+	paired.value = (await invoke<PairedPeer[]>('paired_peers')) ?? [];
+}
+
+/** Empieza a parear con un escritorio: abre el diálogo y dispara el pareo. */
+async function pair(peer: Peer): Promise<void> {
+	result.value = null;
+	pairing.value = { deviceId: peer.device_id, name: peer.name, sas: null };
+	try {
+		await invoke('pair_request', { deviceId: peer.device_id });
+	} catch (error) {
+		pairing.value = null;
+		result.value = { device_id: peer.device_id, status: 'error', message: String(error) };
+	}
+}
+
+/** La decisión de la persona sobre el SAS. El resultado llega por evento. */
+async function confirm(accept: boolean): Promise<void> {
+	try {
+		await invoke('pair_confirm', { accept });
+	} catch (error) {
+		console.error('No se pudo enviar la confirmación', error);
+	}
+}
 
 onMounted(async () => {
 	try {
-		// Suscribirse ANTES de arrancar, para no perder el primer evento; igual se
-		// pide la lista actual por si ya había algo visto.
-		const un = await listen<Peer[]>('peers-changed', (evento) => {
-			peers.value = evento.payload ?? [];
-		});
+		unlistens.push(
+			await listen<Peer[]>('peers-changed', (e) => {
+				peers.value = e.payload ?? [];
+			}),
+			await listen<string>('pairing-sas', (e) => {
+				if (pairing.value !== null) {
+					pairing.value.sas = e.payload;
+				}
+			}),
+			await listen<PairingResult>('pairing-result', (e) => {
+				pairing.value = null;
+				result.value = e.payload;
+				if (e.payload.status === 'paired') {
+					refreshPaired().catch((error) =>
+						console.error('No se pudo refrescar los vinculados', error)
+					);
+				}
+			})
+		);
 		if (disposed) {
-			un();
 			return;
 		}
-		unlisten = un;
 
 		await invoke('discovery_start');
 		if (disposed) {
-			// Se desmontó durante el arranque: deshacerlo, o queda navegando solo.
 			invoke('discovery_stop').catch(() => {});
 			return;
 		}
 
-		// `?? []` por si `invoke` no devuelve nada: la lista tiene que seguir siendo
-		// un arreglo o el `v-for` y el `.length` del template fallan.
-		const descubiertos = (await invoke<Peer[]>('discovered_peers')) ?? [];
-		// Se pudo desmontar durante esta última espera: no escribir el estado de un
-		// componente que ya no está.
-		if (disposed) {
-			return;
-		}
-		peers.value = descubiertos;
+		peers.value = (await invoke<Peer[]>('discovered_peers')) ?? [];
+		await refreshPaired();
 	} catch (error) {
 		console.error('No se pudo iniciar el descubrimiento', error);
 	}
 });
 
 onUnmounted(() => {
-	// Marcar ANTES de limpiar: lo que esté pendiente en `onMounted` lo ve y se
-	// suelta solo.
 	disposed = true;
-	if (unlisten !== null) {
-		unlisten();
+	for (const un of unlistens) {
+		un();
 	}
-	// Dejar de navegar al salir; si falla no hay nada que hacer salvo registrarlo.
 	invoke('discovery_stop').catch((error) => {
 		console.error('No se pudo detener el descubrimiento', error);
 	});
@@ -95,10 +142,23 @@ onUnmounted(() => {
         icon-type="symbol" />
 
       <div class="flex items-center gap-2">
-        <StatusDot tone="neutral" :label="t('inicio.estado.sinVincular')" />
-        <span class="text-tx-muted">{{ t('inicio.estado.sinVincular') }}</span>
+        <StatusDot
+          :tone="paired.length > 0 ? 'success' : 'neutral'"
+          :label="paired.length > 0 ? t('inicio.estado.vinculado') : t('inicio.estado.sinVincular')" />
+        <span class="text-tx-muted">
+          {{ paired.length > 0 ? t('inicio.estado.vinculado') : t('inicio.estado.sinVincular') }}
+        </span>
       </div>
     </section>
+
+    <p
+      v-if="result !== null"
+      class="w-full max-w-sm rounded-corner-m px-4 py-3 text-center text-sm"
+      :class="result.status === 'paired' ? 'text-status-success' : 'text-tx-muted'">
+      {{ result.status === 'error' && result.message
+        ? result.message
+        : t(`inicio.resultado.${result.status}`) }}
+    </p>
 
     <section class="flex w-full max-w-sm flex-col gap-3">
       <h2 class="px-1 text-sm font-medium text-tx-muted">
@@ -115,11 +175,63 @@ onUnmounted(() => {
         <li
           v-for="peer in peers"
           :key="peer.device_id"
-          class="flex items-center justify-between rounded-corner-m bg-ui-surface/70 px-4 py-3 shadow-surface-s">
-          <span class="font-medium text-tx-main">{{ peer.name }}</span>
-          <span class="text-sm text-tx-muted">{{ t(`inicio.tipo.${peer.kind}`) }}</span>
+          class="flex items-center justify-between gap-3 rounded-corner-m bg-ui-surface/70 px-4 py-3 shadow-surface-s">
+          <div class="flex min-w-0 flex-col">
+            <span class="truncate font-medium text-tx-main">{{ peer.name }}</span>
+            <span class="text-xs text-tx-muted">{{ t(`inicio.tipo.${peer.kind}`) }}</span>
+          </div>
+          <span
+            v-if="pairedIds.has(peer.device_id)"
+            class="shrink-0 text-sm text-status-success">
+            {{ t('inicio.descubiertos.vinculado') }}
+          </span>
+          <button
+            v-else
+            type="button"
+            class="shrink-0 rounded-corner-m bg-primary px-4 py-2 text-sm font-medium text-tx-on-primary transition-opacity hover:opacity-90 disabled:opacity-50"
+            :disabled="pairing !== null"
+            @click="pair(peer)">
+            {{ t('inicio.descubiertos.vincular') }}
+          </button>
         </li>
       </ul>
     </section>
+
+    <!-- Diálogo del SAS: mientras hay un pareo en curso. -->
+    <div
+      v-if="pairing !== null"
+      class="fixed inset-0 z-10 flex items-center justify-center bg-ui-bg/80 p-6">
+      <div
+        class="flex w-full max-w-sm flex-col items-center gap-4 rounded-corner-l bg-ui-surface p-6 shadow-surface-l">
+        <h2 class="text-center text-lg font-medium text-tx-main">
+          {{ t('inicio.sas.titulo') }}
+        </h2>
+
+        <p
+          v-if="pairing.sas === null"
+          class="py-4 text-center text-tx-muted">
+          {{ t('inicio.sas.conectando') }}
+        </p>
+
+        <template v-else>
+          <p class="text-center text-sm text-tx-muted">{{ t('inicio.sas.instruccion') }}</p>
+          <p class="font-mono text-4xl tracking-widest text-tx-main">{{ pairing.sas }}</p>
+          <div class="flex w-full gap-3">
+            <button
+              type="button"
+              class="flex-1 rounded-corner-m bg-ui-surface px-4 py-2 text-sm font-medium text-tx-main shadow-surface-s transition-opacity hover:opacity-90"
+              @click="confirm(false)">
+              {{ t('inicio.sas.rechazar') }}
+            </button>
+            <button
+              type="button"
+              class="flex-1 rounded-corner-m bg-primary px-4 py-2 text-sm font-medium text-tx-on-primary transition-opacity hover:opacity-90"
+              @click="confirm(true)">
+              {{ t('inicio.sas.aceptar') }}
+            </button>
+          </div>
+        </template>
+      </div>
+    </div>
   </main>
 </template>
