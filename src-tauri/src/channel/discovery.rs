@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 
 use mdns_sd::ServiceInfo;
-use vasak_connect_protocol::pure::parse_peer_txt;
+use vasak_connect_protocol::pure::{device_id_from_fingerprint, parse_peer_txt};
 use vasak_connect_protocol::wire::PeerInfo;
 
 /// Un escritorio visto en la red: lo que anuncia y dónde contestarle.
@@ -57,6 +57,15 @@ fn pick_addr(addresses: &[IpAddr], port: u16) -> Option<SocketAddr> {
 /// con la que conectarse.
 pub fn resolved(info: &ServiceInfo) -> Option<Discovered> {
     let peer = parse_peer_txt(&txt_map(info))?;
+    // El `device_id` anunciado tiene que derivar de la huella anunciada. Un daemon
+    // honesto lo arma así (`device_id_from_fingerprint`); si no coinciden, el
+    // anuncio está mal formado o es tramposo y se descarta. Con esto el `device_id`
+    // de un descubierto es siempre el derivado de la huella, y la interfaz puede
+    // casar «ya vinculado» —que se guarda con el id derivado de la huella del
+    // certificado— por `device_id` sin confundirse.
+    if peer.device_id != device_id_from_fingerprint(&peer.fingerprint) {
+        return None;
+    }
     let addresses: Vec<IpAddr> = info.get_addresses().iter().copied().collect();
     let addr = pick_addr(&addresses, info.get_port())?;
     Some(Discovered {
@@ -71,38 +80,47 @@ mod tests {
     use super::*;
     use vasak_connect_protocol::wire::{DeviceKind, PROTOCOL_VERSION, SERVICE_TYPE};
 
+    /// Una huella de ejemplo y el `device_id` que de ella deriva —como lo arma un
+    /// daemon honesto—, para que los anuncios de prueba pasen el chequeo de
+    /// consistencia id↔huella.
+    const FP: &str = "AA:BB:CC:DD";
+
     /// Arma un `ServiceInfo` como el que publica el daemon, con el TXT del
     /// contrato, para probar la traducción sin una red de verdad.
-    fn servicio(props: &[(&str, &str)]) -> ServiceInfo {
+    fn servicio(props: &[(String, String)]) -> ServiceInfo {
+        let prestados: Vec<(&str, &str)> = props
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
         ServiceInfo::new(
             SERVICE_TYPE,
             "escritorio-de-joaco",
             "escritorio-de-joaco.local.",
             "192.168.1.50",
             5544,
-            props,
+            &prestados[..],
         )
         .unwrap()
     }
 
-    fn txt_valido() -> Vec<(&'static str, &'static str)> {
+    fn txt_valido() -> Vec<(String, String)> {
         vec![
-            ("id", "abc123"),
-            ("name", "Escritorio de Joaco"),
-            ("kind", "desktop"),
-            ("proto", "2"),
-            ("fp", "AA:BB:CC"),
+            ("id".into(), device_id_from_fingerprint(FP)),
+            ("name".into(), "Escritorio de Joaco".into()),
+            ("kind".into(), "desktop".into()),
+            ("proto".into(), "2".into()),
+            ("fp".into(), FP.into()),
         ]
     }
 
     #[test]
     fn un_anuncio_valido_da_el_par_y_la_direccion() {
         let d = resolved(&servicio(&txt_valido())).expect("debería resolver");
-        assert_eq!(d.peer.device_id, "abc123");
+        assert_eq!(d.peer.device_id, device_id_from_fingerprint(FP));
         assert_eq!(d.peer.name, "Escritorio de Joaco");
         assert_eq!(d.peer.kind, DeviceKind::Desktop);
         assert_eq!(d.peer.protocol_version, PROTOCOL_VERSION);
-        assert_eq!(d.peer.fingerprint, "AA:BB:CC");
+        assert_eq!(d.peer.fingerprint, FP);
         assert_eq!(
             d.addr,
             SocketAddr::new(IpAddr::from([192, 168, 1, 50]), 5544)
@@ -111,17 +129,26 @@ mod tests {
     }
 
     #[test]
+    fn un_id_que_no_deriva_de_la_huella_se_descarta() {
+        let mut props = txt_valido();
+        // Un id que no sale de la huella: anuncio tramposo o mal formado.
+        props.retain(|(k, _)| k != "id");
+        props.push(("id".into(), "id-inventado".into()));
+        assert!(resolved(&servicio(&props)).is_none());
+    }
+
+    #[test]
     fn sin_la_huella_el_anuncio_se_descarta() {
         let mut props = txt_valido();
-        props.retain(|(k, _)| *k != "fp");
+        props.retain(|(k, _)| k != "fp");
         assert!(resolved(&servicio(&props)).is_none());
     }
 
     #[test]
     fn un_kind_desconocido_no_descarta_el_anuncio() {
         let mut props = txt_valido();
-        props.retain(|(k, _)| *k != "kind");
-        props.push(("kind", "smartwatch"));
+        props.retain(|(k, _)| k != "kind");
+        props.push(("kind".into(), "smartwatch".into()));
         let d = resolved(&servicio(&props)).expect("debería resolver igual");
         assert_eq!(d.peer.kind, DeviceKind::Unknown);
     }

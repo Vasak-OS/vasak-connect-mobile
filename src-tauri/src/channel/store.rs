@@ -25,6 +25,10 @@ pub struct PairedPeer {
 }
 
 const FILE: &str = "paired.json";
+/// El temporal del escritorio atómico. Se escribe entero y recién después se
+/// renombra sobre `paired.json`: así un corte a mitad de escritura no deja el
+/// archivo real truncado (que `load` leería como vacío y perdería los pares).
+const FILE_TMP: &str = "paired.json.tmp";
 
 /// Inserta o reemplaza un par por `device_id`. Reemplazar es a propósito: si un
 /// escritorio conocido se vuelve a parear (otra huella), queda la nueva.
@@ -43,12 +47,17 @@ pub async fn load(dir: &Path) -> Vec<PairedPeer> {
     }
 }
 
-/// Agrega (o reemplaza) un par y persiste la lista entera.
+/// Agrega (o reemplaza) un par y persiste la lista entera, de forma atómica:
+/// escribe un temporal completo y lo renombra sobre el archivo real. El `rename`
+/// en el mismo directorio es atómico, así que `load` ve o la lista vieja entera o
+/// la nueva entera, nunca una a medias.
 pub async fn add(dir: &Path, peer: PairedPeer) -> std::io::Result<()> {
     let peers = upsert(load(dir).await, peer);
     let bytes = serde_json::to_vec_pretty(&peers).expect("Vec<PairedPeer> siempre serializa");
     tokio::fs::create_dir_all(dir).await?;
-    tokio::fs::write(dir.join(FILE), bytes).await
+    let tmp = dir.join(FILE_TMP);
+    tokio::fs::write(&tmp, bytes).await?;
+    tokio::fs::rename(&tmp, dir.join(FILE)).await
 }
 
 #[cfg(test)]

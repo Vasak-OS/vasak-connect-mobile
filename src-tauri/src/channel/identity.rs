@@ -82,6 +82,16 @@ fn generate() -> Result<(Vec<u8>, Zeroizing<Vec<u8>>), rcgen::Error> {
     Ok((cert_der, key_der))
 }
 
+/// Borra un archivo si está; no es error que no exista (es el caso normal la
+/// primera vez).
+async fn remove_if_exists(path: &Path) -> Result<(), IdentityError> {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(IdentityError::Io(err)),
+    }
+}
+
 /// Carga la identidad del dir dado, o la crea y la guarda si falta.
 ///
 /// Usa los dos archivos sólo si **los dos** están; si falta cualquiera, genera un
@@ -106,6 +116,13 @@ pub async fn load_or_create(dir: &Path) -> Result<Identity, IdentityError> {
     tokio::fs::create_dir_all(dir)
         .await
         .map_err(IdentityError::Io)?;
+    // Borrar el certificado viejo ANTES de escribir la clave nueva, para que no
+    // pueda quedar un certificado de una generación con la clave de otra: mientras
+    // dura la reescritura el certificado no existe, así que un corte en el medio
+    // hace que el próximo arranque regenere todo en vez de aceptar un par
+    // desapareado (que haría fallar el TLS siempre). «Ambos presentes» sólo vuelve
+    // a ser cierto cuando la última escritura —el certificado— terminó.
+    remove_if_exists(&cert_path).await?;
     tokio::fs::write(&key_path, &key_der[..])
         .await
         .map_err(IdentityError::Io)?;

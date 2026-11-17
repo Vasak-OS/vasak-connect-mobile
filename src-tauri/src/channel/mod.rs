@@ -6,7 +6,13 @@
 //! la máquina de estados del pareo— es `vasak_connect_protocol::pure`, la misma
 //! que corre el daemon; acá vive el I/O (mDNS, TLS, DH, disco) y el puente con la
 //! interfaz.
+//!
+//! Este archivo tiene el **estado** del canal y la lógica que se puede prober sin
+//! una ventana ni una red. La capa que toca Tauri y los sockets —los comandos y la
+//! orquestación del pareo— vive en [`commands`], que la puerta de cobertura excluye
+//! (se verifica contra el servicio real, no con pruebas unitarias).
 
+mod commands;
 mod discovery;
 mod identity;
 mod pairing;
@@ -17,15 +23,13 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use mdns_sd::{ServiceDaemon, ServiceEvent};
-use serde::Serialize;
-use tauri::{AppHandle, Emitter, Manager, State};
-use tokio::sync::{mpsc, oneshot};
-use vasak_connect_protocol::wire::{DeviceKind, PeerInfo, PROTOCOL_VERSION, SERVICE_TYPE};
+use tokio::sync::oneshot;
+use vasak_connect_protocol::wire::PeerInfo;
 
 use discovery::Discovered;
 use identity::Identity;
-use store::PairedPeer;
-use transport::Session;
+
+pub use commands::init;
 
 /// El nombre con el que el teléfono se presenta al escritorio (lo que la persona
 /// ve al confirmar el pareo).
@@ -65,6 +69,12 @@ struct Inner {
     /// La identidad TLS del teléfono, cargada del disco la primera vez que hace
     /// falta y cacheada (generarla es caro y tiene que ser estable entre pareos).
     identity: Option<Arc<Identity>>,
+    /// Hay un pareo en curso (de `pair_request` hasta que termina). Es el guardia
+    /// de «uno a la vez»: se reserva ANTES de cargar la identidad y se libera recién
+    /// al terminar. Se lleva aparte de `pending_confirm` a propósito: `pair_confirm`
+    /// consume el `pending_confirm`, pero el pareo sigue vivo esperando al par, así
+    /// que el guardia no puede depender de que esa ranura siga ocupada.
+    pairing_active: bool,
     /// El canal por el que `pair_confirm` le pasa la decisión de la persona al
     /// pareo en curso. `Some` sólo mientras hay un pareo esperando confirmación.
     pending_confirm: Option<oneshot::Sender<bool>>,
@@ -93,54 +103,10 @@ fn snapshot(inner: &Inner) -> Vec<PeerInfo> {
     inner.peers.values().map(|d| d.peer.clone()).collect()
 }
 
-/// Empieza a navegar por mDNS. Idempotente: si ya hay un demonio, no abre otro.
-#[tauri::command]
-fn discovery_start(app: AppHandle, state: State<'_, ChannelState>) -> Result<(), String> {
-    let receiver = {
-        let mut inner = state.inner.lock().map_err(|_| "estado envenenado")?;
-        if inner.daemon.is_some() {
-            return Ok(());
-        }
-        let daemon = ServiceDaemon::new().map_err(|e| e.to_string())?;
-        let receiver = daemon.browse(SERVICE_TYPE).map_err(|e| e.to_string())?;
-        inner.daemon = Some(daemon);
-        receiver
-    };
-
-    let app = app.clone();
-    std::thread::spawn(move || {
-        // `recv` falla cuando el demonio se apaga (`discovery_stop`) y cierra el
-        // canal: ahí el hilo termina solo.
-        while let Ok(event) = receiver.recv() {
-            if apply_event(&app, event) {
-                if let Some(state) = app.try_state::<ChannelState>() {
-                    let list = {
-                        // Recuperar un candado envenenado en vez de `expect`: si un
-                        // tenedor paniqueó, el peor caso es una lista de
-                        // descubiertos a medio actualizar, no un invariante roto.
-                        // Paniquear acá mataría el hilo del browse y el
-                        // descubrimiento se apagaría en silencio.
-                        let inner = state.inner.lock().unwrap_or_else(|e| e.into_inner());
-                        snapshot(&inner)
-                    };
-                    let _ = app.emit(PEERS_CHANGED, list);
-                }
-            }
-        }
-    });
-
-    Ok(())
-}
-
 /// Aplica un evento del browse al estado. Devuelve `true` si la lista cambió (hay
-/// que reemitir), `false` si el evento no la tocó.
-fn apply_event(app: &AppHandle, event: ServiceEvent) -> bool {
-    let Some(state) = app.try_state::<ChannelState>() else {
-        return false;
-    };
-    // Recuperar un candado envenenado (ver el bucle del browse): no paniquear el
-    // hilo del descubrimiento por el estado de un tenedor anterior.
-    let mut inner = state.inner.lock().unwrap_or_else(|e| e.into_inner());
+/// que reemitir), `false` si el evento no la tocó. Puro sobre el estado: el hilo
+/// del browse toma el candado y llama acá.
+fn apply_event(inner: &mut Inner, event: ServiceEvent) -> bool {
     match event {
         ServiceEvent::ServiceResolved(info) => match discovery::resolved(&info) {
             Some(d) => inner.remember(d),
@@ -151,221 +117,6 @@ fn apply_event(app: &AppHandle, event: ServiceEvent) -> bool {
         ServiceEvent::ServiceRemoved(_, fullname) => inner.forget(&fullname),
         _ => false,
     }
-}
-
-/// Deja de navegar y olvida lo visto. Apagar el demonio cierra el browse y su
-/// hilo termina.
-#[tauri::command]
-fn discovery_stop(app: AppHandle, state: State<'_, ChannelState>) -> Result<(), String> {
-    {
-        let mut inner = state.inner.lock().map_err(|_| "estado envenenado")?;
-        if let Some(daemon) = inner.daemon.take() {
-            let _ = daemon.shutdown();
-        }
-        inner.peers.clear();
-    }
-    let _ = app.emit(PEERS_CHANGED, Vec::<PeerInfo>::new());
-    Ok(())
-}
-
-/// La lista actual de escritorios vistos, para que la interfaz pueda pedirla al
-/// montar sin esperar al primer evento.
-#[tauri::command]
-fn discovered_peers(state: State<'_, ChannelState>) -> Result<Vec<PeerInfo>, String> {
-    let inner = state.inner.lock().map_err(|_| "estado envenenado")?;
-    Ok(snapshot(&inner))
-}
-
-/// La identidad TLS del teléfono: la del caché, o se carga/crea del disco y se
-/// cachea. Generarla es caro y tiene que ser estable, por eso se hace una vez.
-async fn identity_for(
-    app: &AppHandle,
-    state: &State<'_, ChannelState>,
-) -> Result<Arc<Identity>, String> {
-    if let Some(id) = state
-        .inner
-        .lock()
-        .map_err(|_| "estado envenenado")?
-        .identity
-        .clone()
-    {
-        return Ok(id);
-    }
-    let dir = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
-    let id = Arc::new(
-        identity::load_or_create(&dir)
-            .await
-            .map_err(|e| e.to_string())?,
-    );
-    state
-        .inner
-        .lock()
-        .map_err(|_| "estado envenenado")?
-        .identity = Some(id.clone());
-    Ok(id)
-}
-
-/// Lo que viaja en el evento [`PAIRING_RESULT`].
-#[derive(Clone, Serialize)]
-struct PairingResultPayload {
-    device_id: String,
-    /// `paired`, `rejected_local`, `rejected_peer`, `aborted` o `error`.
-    status: &'static str,
-    message: Option<String>,
-}
-
-/// Pide parear con un escritorio descubierto. Arranca una tarea que abre el TLS y
-/// corre el pareo; la interfaz sigue por los eventos [`PAIRING_SAS`] (mostrar el
-/// código y pedir confirmación) y [`PAIRING_RESULT`] (cómo terminó). Devuelve ya,
-/// sin esperar a que el pareo termine.
-#[tauri::command]
-async fn pair_request(
-    app: AppHandle,
-    state: State<'_, ChannelState>,
-    device_id: String,
-) -> Result<(), String> {
-    let addr = {
-        let inner = state.inner.lock().map_err(|_| "estado envenenado")?;
-        inner.peers.get(&device_id).map(|d| d.addr)
-    }
-    .ok_or("ese escritorio ya no está en la lista")?;
-
-    let identity = identity_for(&app, &state).await?;
-    let own = PeerInfo {
-        device_id: identity.device_id.clone(),
-        name: SELF_NAME.to_string(),
-        kind: DeviceKind::Phone,
-        protocol_version: PROTOCOL_VERSION,
-        fingerprint: identity.fingerprint.clone(),
-    };
-
-    // El canal por el que `pair_confirm` traerá la decisión de la persona.
-    let (confirm_tx, confirm_rx) = oneshot::channel::<bool>();
-    {
-        let mut inner = state.inner.lock().map_err(|_| "estado envenenado")?;
-        // Un solo pareo a la vez: no pisar un `confirm` en curso. El backend NO se
-        // apoya en el botón deshabilitado de la UI para serializar (defensa en
-        // profundidad, H2 del review): si pisara la ranura, un «aceptar» podría
-        // caer en una sesión cuyo SAS la persona no comparó.
-        if inner.pending_confirm.is_some() {
-            return Err("ya hay un pareo en curso".to_string());
-        }
-        inner.pending_confirm = Some(confirm_tx);
-    }
-
-    // El SAS que el pareo quiera mostrar se reenvía como evento.
-    let (sas_tx, mut sas_rx) = mpsc::unbounded_channel::<String>();
-    let app_sas = app.clone();
-    tauri::async_runtime::spawn(async move {
-        while let Some(code) = sas_rx.recv().await {
-            let _ = app_sas.emit(PAIRING_SAS, code);
-        }
-    });
-
-    let dir = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
-    let app_task = app.clone();
-    tauri::async_runtime::spawn(async move {
-        let outcome = async {
-            let mut session = Session::connect(addr, &identity)
-                .await
-                .map_err(|e| e.to_string())?;
-            pairing::run(&mut session, &own, sas_tx, confirm_rx)
-                .await
-                .map_err(|e| e.to_string())
-        }
-        .await;
-        finish_pairing(&app_task, &dir, &device_id, outcome).await;
-    });
-
-    Ok(())
-}
-
-/// Cierra un pareo: limpia el canal de confirmación, persiste el par si se fijó, y
-/// avisa a la interfaz cómo terminó.
-async fn finish_pairing(
-    app: &AppHandle,
-    dir: &std::path::Path,
-    device_id: &str,
-    outcome: Result<pairing::Outcome, String>,
-) {
-    if let Some(state) = app.try_state::<ChannelState>() {
-        if let Ok(mut inner) = state.inner.lock() {
-            inner.pending_confirm = None;
-        }
-    }
-
-    let payload = match outcome {
-        Ok(pairing::Outcome::Paired(peer)) => {
-            let message = store::add(dir, peer).await.err().map(|e| e.to_string());
-            PairingResultPayload {
-                device_id: device_id.to_string(),
-                // Si falló persistir, el par quedó fijado en memoria pero no en
-                // disco: se reporta como error para que la persona reintente.
-                status: if message.is_some() { "error" } else { "paired" },
-                message,
-            }
-        }
-        Ok(pairing::Outcome::RejectedLocally) => PairingResultPayload {
-            device_id: device_id.to_string(),
-            status: "rejected_local",
-            message: None,
-        },
-        Ok(pairing::Outcome::RejectedByPeer) => PairingResultPayload {
-            device_id: device_id.to_string(),
-            status: "rejected_peer",
-            message: None,
-        },
-        Ok(pairing::Outcome::Aborted) => PairingResultPayload {
-            device_id: device_id.to_string(),
-            status: "aborted",
-            message: None,
-        },
-        Err(error) => PairingResultPayload {
-            device_id: device_id.to_string(),
-            status: "error",
-            message: Some(error),
-        },
-    };
-    let _ = app.emit(PAIRING_RESULT, payload);
-}
-
-/// La decisión de la persona sobre el SAS en curso: `true` acepta, `false`
-/// rechaza. Falla si no hay un pareo esperando.
-#[tauri::command]
-fn pair_confirm(state: State<'_, ChannelState>, accept: bool) -> Result<(), String> {
-    let tx = {
-        let mut inner = state.inner.lock().map_err(|_| "estado envenenado")?;
-        inner.pending_confirm.take()
-    }
-    .ok_or("no hay un pareo esperando confirmación")?;
-    tx.send(accept).map_err(|_| "el pareo ya había terminado")?;
-    Ok(())
-}
-
-/// Los escritorios ya pareados y persistidos.
-#[tauri::command]
-async fn paired_peers(app: AppHandle) -> Result<Vec<PairedPeer>, String> {
-    let dir = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
-    Ok(store::load(&dir).await)
-}
-
-/// Registra el estado del canal y sus comandos en el `Builder`.
-///
-/// Concreto a `Wry` a propósito: `generate_handler!` genera envoltorios que
-/// resuelven `AppHandle` (= `AppHandle<Wry>`) contra un runtime concreto; dentro
-/// de una función genérica sobre `R` no casarían. La app usa `Wry` (ver
-/// `construir_app`), así que no se pierde nada.
-pub fn init(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wry> {
-    builder
-        .manage(ChannelState::default())
-        .invoke_handler(tauri::generate_handler![
-            discovery_start,
-            discovery_stop,
-            discovered_peers,
-            pair_request,
-            pair_confirm,
-            paired_peers
-        ])
 }
 
 #[cfg(test)]
@@ -429,5 +180,25 @@ mod tests {
         // Un evento de salida de un servicio que nunca se vio: no hay que reemitir.
         assert!(!inner.forget("fantasma.local."));
         assert_eq!(snapshot(&inner).len(), 1);
+    }
+
+    #[test]
+    fn apply_event_saca_el_par_al_recibir_su_salida() {
+        let mut inner = Inner::default();
+        inner.remember(discovered("a", "a.local."));
+        let cambio = apply_event(
+            &mut inner,
+            ServiceEvent::ServiceRemoved("_vasakconnect._tcp.local.".into(), "a.local.".into()),
+        );
+        assert!(cambio);
+        assert!(snapshot(&inner).is_empty());
+    }
+
+    #[test]
+    fn apply_event_ignora_los_eventos_que_no_cambian_la_lista() {
+        let mut inner = Inner::default();
+        // `SearchStarted` no toca la lista de descubiertos.
+        let cambio = apply_event(&mut inner, ServiceEvent::SearchStarted("x".into()));
+        assert!(!cambio);
     }
 }

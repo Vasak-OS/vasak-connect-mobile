@@ -23,7 +23,7 @@ use vasak_connect_protocol::pure::{
 use vasak_connect_protocol::wire::{Message, PeerInfo};
 
 use super::store::PairedPeer;
-use super::transport::{Session, SessionError};
+use super::transport::SessionError;
 
 /// Cómo terminó el pareo.
 #[derive(Debug, PartialEq, Eq)]
@@ -94,18 +94,19 @@ fn compute_shared(secret: agreement::EphemeralPrivateKey, peer_public: &[u8]) ->
 /// mostrarle a la persona; `confirm_rx` trae su decisión (aceptar/rechazar), que
 /// puede llegar antes o después de la respuesta del escritorio.
 pub async fn run(
-    session: &mut Session,
+    peer_fingerprint: &str,
     own: &PeerInfo,
+    mut incoming: mpsc::Receiver<Result<Message, SessionError>>,
+    outgoing: mpsc::Sender<Message>,
     sas_tx: mpsc::UnboundedSender<String>,
     confirm_rx: oneshot::Receiver<bool>,
 ) -> Result<Outcome, PairingError> {
     let own_fingerprint = own.fingerprint.clone();
-    let peer_fingerprint = session.peer_fingerprint().to_string();
 
     // 1. Presentarse y recibir la presentación del escritorio, validándola contra
     //    el certificado TLS y la versión del protocolo.
-    session.write(&Message::Hello(own.clone())).await?;
-    let their_info = match session.read().await? {
+    send(&outgoing, Message::Hello(own.clone())).await?;
+    let their_info = match recv(&mut incoming).await? {
         Message::Hello(info) => info,
         other => {
             return Err(PairingError::Handshake(format!(
@@ -113,7 +114,7 @@ pub async fn run(
             )))
         }
     };
-    verify_hello(&their_info, &peer_fingerprint)
+    verify_hello(&their_info, peer_fingerprint)
         .map_err(|err| PairingError::Handshake(err.to_string()))?;
 
     // 2. Iniciar: generar la clave efímera, comprometerse a ella y mandar el
@@ -125,22 +126,28 @@ pub async fn run(
     let action = advance_pairing(&state, PairingEvent::LocalInitiate { commitment });
     state = action.next;
     if let Some(message) = action.send {
-        session.write(&message).await?;
+        send(&outgoing, message).await?;
     }
 
     // 3. Manejar, en el orden que lleguen, la revelación DH y la respuesta del
-    //    escritorio por un lado, y la confirmación local por el otro.
+    //    escritorio por un lado, y la confirmación local por el otro. Las lecturas
+    //    las hace la tarea lectora (reader_loop) y llegan enteras por `incoming`:
+    //    `recv` SÍ es cancel-safe, así que cancelar este `select` no pierde una
+    //    trama a medio leer.
     let mut confirm_rx = Some(confirm_rx);
     loop {
-        let action = tokio::select! {
-            incoming = session.read() => {
-                match incoming? {
-                    Message::PairDh { dh_pub } => {
-                        on_peer_dh(&state, &dh_pub, &mut secret, &own_public, &own_fingerprint, &peer_fingerprint)?
-                    }
-                    Message::PairResponse { accepted } => {
-                        advance_pairing(&state, PairingEvent::PeerResponse { accepted })
-                    }
+        let (action, por_el_par) = tokio::select! {
+            entrante = incoming.recv() => {
+                let message = entrante.ok_or(PairingError::Session(SessionError::Closed))??;
+                match message {
+                    Message::PairDh { dh_pub } => (
+                        on_peer_dh(&state, &dh_pub, &mut secret, &own_public, &own_fingerprint, peer_fingerprint)?,
+                        true,
+                    ),
+                    Message::PairResponse { accepted } => (
+                        advance_pairing(&state, PairingEvent::PeerResponse { accepted }),
+                        true,
+                    ),
                     // Cualquier otro mensaje en medio del pareo se ignora.
                     _ => continue,
                 }
@@ -150,13 +157,13 @@ pub async fn run(
                 // Si el canal de confirmación se cerró sin respuesta, se trata como
                 // un rechazo: no se fija nada sin un sí explícito.
                 let accept = confirm.unwrap_or(false);
-                advance_pairing(&state, PairingEvent::LocalConfirm { accept })
+                (advance_pairing(&state, PairingEvent::LocalConfirm { accept }), false)
             }
         };
 
         state = action.next.clone();
         if let Some(message) = action.send {
-            session.write(&message).await?;
+            send(&outgoing, message).await?;
         }
         if let Some(code) = action.notify_code {
             // Si nadie escucha el SAS (la pantalla se fue), no es fatal acá.
@@ -166,18 +173,40 @@ pub async fn run(
             return Ok(Outcome::Aborted);
         }
         if action.pin {
-            return Ok(Outcome::Paired(paired_from(&peer_fingerprint, &their_info)));
+            return Ok(Outcome::Paired(paired_from(peer_fingerprint, &their_info)));
         }
-        // Volver a reposo sin fijar (y sin abortar) es una cancelación: la decidió
-        // esta persona o el escritorio, según quién dijo que no.
+        // Volver a reposo sin fijar (y sin abortar) es una cancelación. Se clasifica
+        // por QUIÉN rechazó —no por si ya hubo confirmación local—: si la persona
+        // aceptó y después el escritorio rechaza, lo rechazó el par.
         if matches!(state, PairingState::Idle) {
-            return Ok(if confirm_rx.is_none() {
-                Outcome::RejectedLocally
-            } else {
+            return Ok(if por_el_par {
                 Outcome::RejectedByPeer
+            } else {
+                Outcome::RejectedLocally
             });
         }
     }
+}
+
+/// Manda un mensaje por el canal de salida. Si la tarea escritora ya no está, la
+/// sesión se cerró.
+async fn send(outgoing: &mpsc::Sender<Message>, message: Message) -> Result<(), PairingError> {
+    outgoing
+        .send(message)
+        .await
+        .map_err(|_| PairingError::Session(SessionError::Closed))
+}
+
+/// Recibe el próximo mensaje del canal de entrada, o el error de la sesión. Un
+/// canal cerrado (la tarea lectora terminó) es un cierre de la sesión.
+async fn recv(
+    incoming: &mut mpsc::Receiver<Result<Message, SessionError>>,
+) -> Result<Message, PairingError> {
+    incoming
+        .recv()
+        .await
+        .ok_or(PairingError::Session(SessionError::Closed))?
+        .map_err(PairingError::Session)
 }
 
 /// El paso al recibir el `PairDh` del escritorio: computa el secreto compartido
@@ -254,6 +283,143 @@ fn aborted(state: &PairingState) -> pure::PairingAction {
 mod tests {
     use super::*;
     use vasak_connect_protocol::wire::{DeviceKind, PROTOCOL_VERSION};
+
+    fn info(fingerprint: &str, name: &str, kind: DeviceKind) -> PeerInfo {
+        PeerInfo {
+            device_id: device_id_from_fingerprint(fingerprint),
+            name: name.to_string(),
+            kind,
+            protocol_version: PROTOCOL_VERSION,
+            fingerprint: fingerprint.to_string(),
+        }
+    }
+
+    /// Un pareo completo de punta a punta: `run` (el teléfono, iniciador) contra un
+    /// respondedor simulado que hace el lado del escritorio con `pure` + `ring`
+    /// sobre canales en memoria (sin TLS). Prueba que el handshake interopera y que
+    /// con las dos confirmaciones el par queda fijado con la huella correcta.
+    #[tokio::test]
+    async fn un_pareo_completo_fija_al_par() {
+        let desk_fp = "DE:SK:TO:P0";
+        let phone = info("PH:ON:E0:00", "Teléfono de Joaco", DeviceKind::Phone);
+
+        // responder → run (incoming) y run → responder (outgoing).
+        let (to_run_tx, to_run_rx) = mpsc::channel::<Result<Message, SessionError>>(16);
+        let (from_run_tx, mut from_run_rx) = mpsc::channel::<Message>(16);
+        let (sas_tx, mut sas_rx) = mpsc::unbounded_channel::<String>();
+        let (confirm_tx, confirm_rx) = oneshot::channel::<bool>();
+
+        // El escritorio simulado: Hello, PairDh, verificar el compromiso, PairResponse.
+        let responder = tokio::spawn(async move {
+            let _hello = from_run_rx.recv().await.unwrap();
+            to_run_tx
+                .send(Ok(Message::Hello(info(
+                    desk_fp,
+                    "Escritorio",
+                    DeviceKind::Desktop,
+                ))))
+                .await
+                .unwrap();
+
+            let commitment = match from_run_rx.recv().await.unwrap() {
+                Message::PairRequest { commitment } => commitment,
+                otro => panic!("esperaba PairRequest, llegó {otro:?}"),
+            };
+            let (b_secret, b_public) = generate_ephemeral().unwrap();
+            to_run_tx
+                .send(Ok(Message::PairDh {
+                    dh_pub: hex::encode(&b_public),
+                }))
+                .await
+                .unwrap();
+
+            let a_public_hex = match from_run_rx.recv().await.unwrap() {
+                Message::PairReveal { dh_pub } => dh_pub,
+                otro => panic!("esperaba PairReveal, llegó {otro:?}"),
+            };
+            let a_public = hex::decode(&a_public_hex).unwrap();
+            // El compromiso del PairRequest tiene que casar con la clave revelada.
+            assert!(pure::verify_commitment(&commitment, &a_public));
+            // El escritorio también computa el secreto (acá sólo se verifica que el
+            // acuerdo da algo; el SAS en sí lo prueba `iniciador_y_respondedor...`).
+            assert!(compute_shared(b_secret, &a_public).is_some());
+            to_run_tx
+                .send(Ok(Message::PairResponse { accepted: true }))
+                .await
+                .unwrap();
+            // Mantener vivo `to_run_tx` hasta acá; al salir se suelta.
+        });
+
+        // La persona confirma recién cuando se muestra el SAS.
+        let confirmer = tokio::spawn(async move {
+            let _code = sas_rx.recv().await.expect("debería mostrarse un SAS");
+            confirm_tx.send(true).unwrap();
+        });
+
+        let outcome = run(desk_fp, &phone, to_run_rx, from_run_tx, sas_tx, confirm_rx)
+            .await
+            .unwrap();
+        responder.await.unwrap();
+        confirmer.await.unwrap();
+
+        match outcome {
+            Outcome::Paired(paired) => {
+                assert_eq!(paired.fingerprint, desk_fp);
+                assert_eq!(paired.device_id, device_id_from_fingerprint(desk_fp));
+                assert_eq!(paired.name, "Escritorio");
+            }
+            otro => panic!("esperaba Paired, fue {otro:?}"),
+        }
+    }
+
+    /// Si la persona rechaza el SAS, no se fija nada y se reporta como rechazo local.
+    #[tokio::test]
+    async fn si_la_persona_rechaza_no_se_fija() {
+        let desk_fp = "DE:SK:TO:P1";
+        let phone = info("PH:ON:E1:11", "Teléfono", DeviceKind::Phone);
+
+        let (to_run_tx, to_run_rx) = mpsc::channel::<Result<Message, SessionError>>(16);
+        let (from_run_tx, mut from_run_rx) = mpsc::channel::<Message>(16);
+        let (sas_tx, mut sas_rx) = mpsc::unbounded_channel::<String>();
+        let (confirm_tx, confirm_rx) = oneshot::channel::<bool>();
+
+        let responder = tokio::spawn(async move {
+            let _hello = from_run_rx.recv().await.unwrap();
+            to_run_tx
+                .send(Ok(Message::Hello(info(
+                    desk_fp,
+                    "Escritorio",
+                    DeviceKind::Desktop,
+                ))))
+                .await
+                .unwrap();
+            let _req = from_run_rx.recv().await.unwrap();
+            let (_b_secret, b_public) = generate_ephemeral().unwrap();
+            to_run_tx
+                .send(Ok(Message::PairDh {
+                    dh_pub: hex::encode(&b_public),
+                }))
+                .await
+                .unwrap();
+            let _reveal = from_run_rx.recv().await.unwrap();
+            // El escritorio espera; la persona del teléfono va a rechazar.
+            let _ = to_run_tx; // mantener vivo hasta el final del pareo
+            std::future::pending::<()>().await;
+        });
+
+        let confirmer = tokio::spawn(async move {
+            let _code = sas_rx.recv().await.expect("debería mostrarse un SAS");
+            confirm_tx.send(false).unwrap();
+        });
+
+        let outcome = run(desk_fp, &phone, to_run_rx, from_run_tx, sas_tx, confirm_rx)
+            .await
+            .unwrap();
+        confirmer.await.unwrap();
+        responder.abort();
+
+        assert_eq!(outcome, Outcome::RejectedLocally);
+    }
 
     /// El par que se persiste saca su `device_id` de la huella del certificado
     /// (autenticada), NO del `Hello` del escritorio. Si no, un escritorio

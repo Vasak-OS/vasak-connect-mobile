@@ -61,6 +61,21 @@ async function refreshPaired(): Promise<void> {
 	paired.value = (await invoke<PairedPeer[]>('paired_peers')) ?? [];
 }
 
+/**
+ * Registra un oyente y guarda su limpieza en el acto. Si el componente ya se
+ * desmontó cuando la suscripción resuelve, se suelta ahí mismo: así un oyente que
+ * se registra tarde no queda colgado (su limpieza no se perdería esperando a que
+ * terminen las otras suscripciones).
+ */
+async function escuchar<T>(evento: string, manejar: (payload: T) => void): Promise<void> {
+	const un = await listen<T>(evento, (e) => manejar(e.payload));
+	if (disposed) {
+		un();
+	} else {
+		unlistens.push(un);
+	}
+}
+
 /** Empieza a parear con un escritorio: abre el diálogo y dispara el pareo. */
 async function pair(peer: Peer): Promise<void> {
 	result.value = null;
@@ -84,25 +99,23 @@ async function confirm(accept: boolean): Promise<void> {
 
 onMounted(async () => {
 	try {
-		unlistens.push(
-			await listen<Peer[]>('peers-changed', (e) => {
-				peers.value = e.payload ?? [];
-			}),
-			await listen<string>('pairing-sas', (e) => {
-				if (pairing.value !== null) {
-					pairing.value.sas = e.payload;
-				}
-			}),
-			await listen<PairingResult>('pairing-result', (e) => {
-				pairing.value = null;
-				result.value = e.payload;
-				if (e.payload.status === 'paired') {
-					refreshPaired().catch((error) =>
-						console.error('No se pudo refrescar los vinculados', error)
-					);
-				}
-			})
-		);
+		await escuchar<Peer[]>('peers-changed', (payload) => {
+			peers.value = payload ?? [];
+		});
+		await escuchar<string>('pairing-sas', (payload) => {
+			if (pairing.value !== null) {
+				pairing.value.sas = payload;
+			}
+		});
+		await escuchar<PairingResult>('pairing-result', (payload) => {
+			pairing.value = null;
+			result.value = payload;
+			if (payload.status === 'paired') {
+				refreshPaired().catch((error) =>
+					console.error('No se pudo refrescar los vinculados', error)
+				);
+			}
+		});
 		if (disposed) {
 			return;
 		}
