@@ -83,7 +83,12 @@ fn discovery_start(app: AppHandle, state: State<'_, ChannelState>) -> Result<(),
             if apply_event(&app, event) {
                 if let Some(state) = app.try_state::<ChannelState>() {
                     let list = {
-                        let inner = state.inner.lock().expect("estado envenenado");
+                        // Recuperar un candado envenenado en vez de `expect`: si un
+                        // tenedor paniqueó, el peor caso es una lista de
+                        // descubiertos a medio actualizar, no un invariante roto.
+                        // Paniquear acá mataría el hilo del browse y el
+                        // descubrimiento se apagaría en silencio.
+                        let inner = state.inner.lock().unwrap_or_else(|e| e.into_inner());
                         snapshot(&inner)
                     };
                     let _ = app.emit(PEERS_CHANGED, list);
@@ -101,7 +106,9 @@ fn apply_event(app: &AppHandle, event: ServiceEvent) -> bool {
     let Some(state) = app.try_state::<ChannelState>() else {
         return false;
     };
-    let mut inner = state.inner.lock().expect("estado envenenado");
+    // Recuperar un candado envenenado (ver el bucle del browse): no paniquear el
+    // hilo del descubrimiento por el estado de un tenedor anterior.
+    let mut inner = state.inner.lock().unwrap_or_else(|e| e.into_inner());
     match event {
         ServiceEvent::ServiceResolved(info) => match discovery::resolved(&info) {
             Some(d) => inner.remember(d),

@@ -30,15 +30,32 @@ const { t } = useI18n();
 
 const peers = ref<Peer[]>([]);
 let unlisten: UnlistenFn | null = null;
+// Si el componente se desmonta mientras el `listen`/`invoke` de arranque siguen
+// pendientes, hay que soltar lo que llegue tarde. Sin esto, un `listen` que
+// resuelve después del desmontaje deja el oyente colgado para siempre y arranca
+// un descubrimiento sin componente que lo gobierne.
+let disposed = false;
 
 onMounted(async () => {
 	try {
 		// Suscribirse ANTES de arrancar, para no perder el primer evento; igual se
 		// pide la lista actual por si ya había algo visto.
-		unlisten = await listen<Peer[]>('peers-changed', (evento) => {
-			peers.value = evento.payload;
+		const un = await listen<Peer[]>('peers-changed', (evento) => {
+			peers.value = evento.payload ?? [];
 		});
+		if (disposed) {
+			un();
+			return;
+		}
+		unlisten = un;
+
 		await invoke('discovery_start');
+		if (disposed) {
+			// Se desmontó durante el arranque: deshacerlo, o queda navegando solo.
+			invoke('discovery_stop').catch(() => {});
+			return;
+		}
+
 		// `?? []` por si `invoke` no devuelve nada: la lista tiene que seguir siendo
 		// un arreglo o el `v-for` y el `.length` del template fallan.
 		peers.value = (await invoke<Peer[]>('discovered_peers')) ?? [];
@@ -48,6 +65,9 @@ onMounted(async () => {
 });
 
 onUnmounted(() => {
+	// Marcar ANTES de limpiar: lo que esté pendiente en `onMounted` lo ve y se
+	// suelta solo.
+	disposed = true;
 	if (unlisten !== null) {
 		unlisten();
 	}
