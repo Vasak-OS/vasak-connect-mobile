@@ -58,7 +58,13 @@ onMounted(async () => {
 
 		// `?? []` por si `invoke` no devuelve nada: la lista tiene que seguir siendo
 		// un arreglo o el `v-for` y el `.length` del template fallan.
-		peers.value = (await invoke<Peer[]>('discovered_peers')) ?? [];
+		const descubiertos = (await invoke<Peer[]>('discovered_peers')) ?? [];
+		// Se pudo desmontar durante esta última espera: no escribir el estado de un
+		// componente que ya no está.
+		if (disposed) {
+			return;
+		}
+		peers.value = descubiertos;
 	} catch (error) {
 		console.error('No se pudo iniciar el descubrimiento', error);
 	}
