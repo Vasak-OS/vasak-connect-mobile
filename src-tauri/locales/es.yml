@@ -15,3 +15,11 @@ inicio:
   descripcion: El compañero móvil de tu escritorio VasakOS. El vínculo con tu equipo llega en una próxima versión.
   estado:
     sinVincular: Sin vincular
+  descubiertos:
+    titulo: Escritorios en tu red
+    buscando: Buscando escritorios de VasakOS…
+  tipo:
+    phone: Teléfono
+    tablet: Tablet
+    desktop: Escritorio
+    unknown: Dispositivo

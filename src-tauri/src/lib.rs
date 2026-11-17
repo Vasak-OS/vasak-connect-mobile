@@ -3,6 +3,7 @@
 //! Lo que hay acá no es decoración: cada pieza resuelve algo que en las
 //! aplicaciones reales del escritorio se rompió al menos una vez.
 
+mod channel;
 mod locales;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -43,7 +44,9 @@ fn construir_app() -> tauri::Builder<tauri::Wry> {
             .plugin(tauri_plugin_vicons::init());
     }
 
-    builder
+    // El canal con el escritorio: su estado y sus comandos (descubrimiento mDNS).
+    // Registra el `invoke_handler`, así que va al final del armado.
+    channel::init(builder)
 }
 
 #[cfg(test)]
