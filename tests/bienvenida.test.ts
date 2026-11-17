@@ -33,4 +33,15 @@ describe('la pantalla de bienvenida', () => {
 		expect(texto).toContain('inicio.descripcion');
 		expect(texto).toContain('inicio.estado.sinVincular');
 	});
+
+	test('muestra la sección de descubiertos buscando mientras no hay escritorios', () => {
+		// El `invoke` del arnés no devuelve escritorios, así que la lista arranca
+		// vacía: la sección tiene que mostrar su título y el texto de «buscando»,
+		// no romperse ni quedar en blanco.
+		const wrapper = mount(WelcomeScreen);
+		const texto = wrapper.text();
+
+		expect(texto).toContain('inicio.descubiertos.titulo');
+		expect(texto).toContain('inicio.descubiertos.buscando');
+	});
 });

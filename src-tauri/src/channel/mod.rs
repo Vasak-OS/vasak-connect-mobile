@@ -38,6 +38,23 @@ struct Inner {
     peers: HashMap<String, Discovered>,
 }
 
+impl Inner {
+    /// Anota (o reemplaza) un escritorio visto. Devuelve `true` siempre: la lista
+    /// que ve la interfaz cambió (apareció o se actualizó un par).
+    fn remember(&mut self, d: Discovered) -> bool {
+        self.peers.insert(d.peer.device_id.clone(), d);
+        true
+    }
+
+    /// Olvida el escritorio cuyo servicio mDNS coincide. `true` si sacó algo, para
+    /// no reemitir por un evento de salida de algo que no estaba.
+    fn forget(&mut self, fullname: &str) -> bool {
+        let before = self.peers.len();
+        self.peers.retain(|_, d| d.fullname != fullname);
+        self.peers.len() != before
+    }
+}
+
 /// La lista que ve la interfaz, derivada del estado. Sólo lo que anuncia cada
 /// par; la dirección se queda del lado de Rust.
 fn snapshot(inner: &Inner) -> Vec<PeerInfo> {
@@ -87,19 +104,12 @@ fn apply_event(app: &AppHandle, event: ServiceEvent) -> bool {
     let mut inner = state.inner.lock().expect("estado envenenado");
     match event {
         ServiceEvent::ServiceResolved(info) => match discovery::resolved(&info) {
-            Some(d) => {
-                inner.peers.insert(d.peer.device_id.clone(), d);
-                true
-            }
+            Some(d) => inner.remember(d),
             None => false,
         },
         // Los eventos de salida sólo traen el nombre completo del servicio, no el
         // `device_id`: se saca la entrada cuyo `fullname` coincide.
-        ServiceEvent::ServiceRemoved(_, fullname) => {
-            let before = inner.peers.len();
-            inner.peers.retain(|_, d| d.fullname != fullname);
-            inner.peers.len() != before
-        }
+        ServiceEvent::ServiceRemoved(_, fullname) => inner.forget(&fullname),
         _ => false,
     }
 }
@@ -169,8 +179,8 @@ mod tests {
     #[test]
     fn el_snapshot_lista_solo_lo_que_anuncia_cada_par() {
         let mut inner = Inner::default();
-        inner.peers.insert("a".into(), discovered("a", "a.local."));
-        inner.peers.insert("b".into(), discovered("b", "b.local."));
+        inner.remember(discovered("a", "a.local."));
+        inner.remember(discovered("b", "b.local."));
         let list = snapshot(&inner);
         assert_eq!(list.len(), 2);
         assert!(list.iter().all(|p| p.protocol_version == PROTOCOL_VERSION));
@@ -179,11 +189,30 @@ mod tests {
     #[test]
     fn un_mismo_device_id_no_se_duplica() {
         let mut inner = Inner::default();
-        inner.peers.insert("a".into(), discovered("a", "a.local."));
+        inner.remember(discovered("a", "a.local."));
         // Reaparece con otro nombre de instancia pero el mismo id.
-        inner
-            .peers
-            .insert("a".into(), discovered("a", "a-2.local."));
+        inner.remember(discovered("a", "a-2.local."));
+        assert_eq!(snapshot(&inner).len(), 1);
+    }
+
+    #[test]
+    fn olvidar_por_fullname_saca_solo_el_que_coincide() {
+        let mut inner = Inner::default();
+        inner.remember(discovered("a", "a.local."));
+        inner.remember(discovered("b", "b.local."));
+
+        assert!(inner.forget("a.local."));
+        let list = snapshot(&inner);
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].device_id, "b");
+    }
+
+    #[test]
+    fn olvidar_algo_que_no_esta_no_cambia_la_lista() {
+        let mut inner = Inner::default();
+        inner.remember(discovered("a", "a.local."));
+        // Un evento de salida de un servicio que nunca se vio: no hay que reemitir.
+        assert!(!inner.forget("fantasma.local."));
         assert_eq!(snapshot(&inner).len(), 1);
     }
 }

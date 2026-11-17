@@ -1,6 +1,6 @@
 [package]
 name = "vasak-connect-mobile"
-version = "0.1.0"
+version = "0.2.0"
 description = "Compañero móvil de VasakOS: vincula el teléfono con el escritorio"
 authors = ["Vasak Group", "Joaquin (Pato) Decima"]
 edition = "2021"

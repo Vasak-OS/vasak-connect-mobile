@@ -20,6 +20,11 @@ use vasak_connect_protocol::wire::PeerInfo;
 /// Un escritorio visto en la red: lo que anuncia y dónde contestarle.
 pub struct Discovered {
     pub peer: PeerInfo,
+    /// Dónde conectarse para parear. Se resuelve y se prueba acá, pero recién lo
+    /// consume el pareo (PR2b): el descubrimiento sólo lista. `allow(dead_code)`
+    /// para no partir la resolución de la dirección —ya probada— y rearmarla
+    /// después. shortcut: el `allow` se saca al llegar el cliente TLS del pareo.
+    #[allow(dead_code)]
     pub addr: SocketAddr,
     /// El nombre completo del servicio mDNS, para poder sacarlo de la lista
     /// cuando `mdns-sd` avise que desapareció (los eventos de salida sólo lo
