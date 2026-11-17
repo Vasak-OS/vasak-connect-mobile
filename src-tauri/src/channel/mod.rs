@@ -243,6 +243,13 @@ async fn pair_request(
     let (confirm_tx, confirm_rx) = oneshot::channel::<bool>();
     {
         let mut inner = state.inner.lock().map_err(|_| "estado envenenado")?;
+        // Un solo pareo a la vez: no pisar un `confirm` en curso. El backend NO se
+        // apoya en el botón deshabilitado de la UI para serializar (defensa en
+        // profundidad, H2 del review): si pisara la ranura, un «aceptar» podría
+        // caer en una sesión cuyo SAS la persona no comparó.
+        if inner.pending_confirm.is_some() {
+            return Err("ya hay un pareo en curso".to_string());
+        }
         inner.pending_confirm = Some(confirm_tx);
     }
 

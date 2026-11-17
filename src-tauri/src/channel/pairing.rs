@@ -17,7 +17,8 @@ use ring::agreement;
 use ring::rand::SystemRandom;
 use tokio::sync::{mpsc, oneshot};
 use vasak_connect_protocol::pure::{
-    self, advance_pairing, derive_sas, sas_commitment, verify_hello, PairingEvent, PairingState,
+    self, advance_pairing, derive_sas, device_id_from_fingerprint, sas_commitment, verify_hello,
+    PairingEvent, PairingState,
 };
 use vasak_connect_protocol::wire::{Message, PeerInfo};
 
@@ -165,12 +166,7 @@ pub async fn run(
             return Ok(Outcome::Aborted);
         }
         if action.pin {
-            return Ok(Outcome::Paired(PairedPeer {
-                device_id: their_info.device_id.clone(),
-                name: their_info.name.clone(),
-                kind: their_info.kind,
-                fingerprint: peer_fingerprint.clone(),
-            }));
+            return Ok(Outcome::Paired(paired_from(&peer_fingerprint, &their_info)));
         }
         // Volver a reposo sin fijar (y sin abortar) es una cancelación: la decidió
         // esta persona o el escritorio, según quién dijo que no.
@@ -222,6 +218,25 @@ fn on_peer_dh(
     ))
 }
 
+/// Arma el par a persistir **desde la huella autenticada**, no del `Hello`.
+///
+/// El `device_id` se deriva de la huella del certificado TLS —lo único que el
+/// handshake y el pinning garantizan—, no del `device_id` que el escritorio
+/// declara en su `Hello`, que no está autenticado (`verify_hello` liga sólo la
+/// huella y la versión). Si se tomara del `Hello`, un escritorio malicioso podría
+/// declarar el `device_id` de uno ya pareado y, como el almacén deduplica por
+/// `device_id`, expulsar su huella fijada tras un pareo confirmado. Derivándolo de
+/// la huella, la clave del almacén queda 1:1 con la huella y no se puede colisionar.
+/// El `name` del `Hello` se guarda sólo como texto para mostrar.
+fn paired_from(peer_fingerprint: &str, their_info: &PeerInfo) -> PairedPeer {
+    PairedPeer {
+        device_id: device_id_from_fingerprint(peer_fingerprint),
+        name: their_info.name.clone(),
+        kind: their_info.kind,
+        fingerprint: peer_fingerprint.to_string(),
+    }
+}
+
 /// Una acción terminal de aborto, para cuando el DH falla: vuelve a reposo y pide
 /// cerrar, sin fijar nada.
 fn aborted(state: &PairingState) -> pure::PairingAction {
@@ -238,6 +253,32 @@ fn aborted(state: &PairingState) -> pure::PairingAction {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vasak_connect_protocol::wire::{DeviceKind, PROTOCOL_VERSION};
+
+    /// El par que se persiste saca su `device_id` de la huella del certificado
+    /// (autenticada), NO del `Hello` del escritorio. Si no, un escritorio
+    /// malicioso que declara el `device_id` de uno ya pareado expulsaría su huella
+    /// fijada (el almacén deduplica por `device_id`). Es el fix de H1 del review.
+    #[test]
+    fn el_par_guardado_usa_el_device_id_de_la_huella_no_el_del_hello() {
+        let their = PeerInfo {
+            // Lo que el escritorio DICE ser: el device_id de otro, ya pareado.
+            device_id: "id-de-otro-ya-pareado".to_string(),
+            name: "Escritorio de Joaco".to_string(),
+            kind: DeviceKind::Desktop,
+            protocol_version: PROTOCOL_VERSION,
+            fingerprint: "huella-que-el-par-declara".to_string(),
+        };
+        let fingerprint = "AA:BB:CC:DD";
+
+        let paired = paired_from(fingerprint, &their);
+        assert_eq!(paired.fingerprint, fingerprint);
+        // La clave del almacén sale de la huella, no del Hello.
+        assert_eq!(paired.device_id, device_id_from_fingerprint(fingerprint));
+        assert_ne!(paired.device_id, "id-de-otro-ya-pareado");
+        // El nombre sí se toma del Hello (sólo para mostrar).
+        assert_eq!(paired.name, "Escritorio de Joaco");
+    }
 
     /// Las dos puntas derivan el MISMO SAS del mismo DH, en el orden canónico
     /// (iniciador primero). Es la interoperabilidad con el daemon: si esto fallara,
