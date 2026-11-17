@@ -1,7 +1,7 @@
 {
-  "name": "vapp",
+  "name": "vasak-connect-mobile",
   "private": true,
-  "version": "0.7.4",
+  "version": "0.1.0",
   "type": "module",
   "scripts": {
     "dev": "bunx --bun vite",
@@ -25,8 +25,6 @@
     "@tauri-apps/plugin-shell": "^2.4.1",
     "@vasakgroup/plugin-config-manager": "^2.13.0",
     "@vasakgroup/plugin-vicons": "^2.2.2",
-    "@vasakgroup/plugin-vsk-contextual-menu": "^2.0.3",
-    "@vasakgroup/plugin-vsk-journal": "^2.0.1",
     "@vasakgroup/tauri-plugin-i18n": "^2.3.1",
     "@vasakgroup/vue-libvasak": "^2.22.0",
     "pinia": "^3.0.4",

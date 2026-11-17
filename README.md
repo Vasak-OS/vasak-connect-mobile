@@ -1,180 +1,87 @@
-# vapp — plantilla de aplicaciones de VasakOS
+# vasak-connect-mobile — el compañero móvil de VasakOS
 
-Punto de partida para una aplicación del escritorio: Tauri 2 + Vue 3 +
-TypeScript + Tailwind 4, con los cuatro plugins de VasakOS ya enchufados y con
-las decisiones que las aplicaciones reales tuvieron que aprender rompiéndose.
+Aplicación móvil (Android / iOS) hecha con **Tauri 2 Mobile + Vue 3 +
+TypeScript + Tailwind 4**, con el mismo design system que el escritorio
+(`@vasakgroup/vue-libvasak`, config-manager, vicons, i18n). Un solo codebase para
+las dos plataformas.
 
-**Lo que hay acá no es andamiaje de relleno.** Cada pieza está porque su ausencia
-causó un bug concreto en `vasak-resonance`, `vasak-terminal`, `vasak-gallery` o
-`vasak-desktop`. Los comentarios del código dicen cuál.
+Nace de la plantilla `vapp` del escritorio, pero sin su ventana: en un teléfono
+la ventana la gobierna el sistema. Lo que quedó es la base del design system y el
+contrato de red; la lógica de **canal y pareo** (SAS/RFC-6189, protocolo v2) llega
+en PRs siguientes.
 
 ---
 
-## Arrancar una aplicación nueva
+## Estado de esta base
 
-```bash
-git clone https://github.com/Vasak-OS/vapp mi-app && cd mi-app && rm -rf .git && git init
-```
+- Primera pantalla de bienvenida/estado con los componentes y tokens del sistema.
+- Dependencia del contrato de red (`vasak-connect-protocol`) declarada; **sin**
+  cliente de canal todavía.
+- Andamio de Android: ver abajo. **iOS no se inicializa en Linux.**
 
-Después, cambiar el nombre en **cinco lugares** —y son cinco, no uno:
+## Compilar
 
-| archivo | qué cambiar |
-|---|---|
-| `package.json` | `name` |
-| `src-tauri/Cargo.toml` | `name`, `[lib] name` (`mi_app_lib`), `description` |
-| `src-tauri/tauri.conf.json` | `productName`, `identifier` (`ar.net.vasak.mi-app`) |
-| `index.html` | `<title>` |
-| `src-tauri/src/main.rs` | la llamada a `mi_app_lib::run()` |
-
-El `identifier` decide dónde van la configuración y los datos del usuario:
-cambiarlo después de la primera ejecución deja huérfano lo que ya se guardó.
-
-Y **verificá que los tests pasen antes de escribir nada**: si el `name` quedó a
-medio cambiar, el test de catálogos lo dice enseguida.
+Dependencias del frontend y pruebas corren en cualquier plataforma:
 
 ```bash
 bun install
-bun test                                   # frontend
-cargo test --manifest-path src-tauri/Cargo.toml   # backend
-bunx --bun tauri dev
+bun test                                          # frontend
+cargo test --manifest-path src-tauri/Cargo.toml   # backend (host)
 ```
+
+### Android
+
+Necesita el SDK + NDK de Android y los targets de Rust. En CachyOS / Arch:
+
+```bash
+sudo pacman -S jdk-openjdk
+paru -S android-sdk-cmdline-tools-latest          # o instalar Android Studio
+export ANDROID_HOME=/opt/android-sdk
+export NDK_HOME="$ANDROID_HOME/ndk/<versión>"
+sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0" "ndk;27.1.12297006"
+
+rustup target add aarch64-linux-android armv7-linux-androideabi i686-linux-android x86_64-linux-android
+
+bunx tauri android init                           # genera src-tauri/gen/android
+bunx tauri android dev                            # emulador o dispositivo
+bunx tauri android build                          # .apk / .aab
+```
+
+`tauri android init` genera el proyecto Gradle en `src-tauri/gen/android/`, que no
+se versiona (lo regenera el init). Hay que correrlo una vez por checkout.
+
+### iOS
+
+`tauri ios init` **sólo corre en macOS con Xcode** — no se puede desde Linux. En
+un Mac: `bunx tauri ios init && bunx tauri ios dev`. El codebase es portable; lo
+único que falta es inicializar el proyecto Xcode allá.
 
 ---
 
-## Lo que ya viene resuelto, y por qué
+## El design system (decisión 8 del taller)
 
-### El marco de la ventana
+La forma es de Once UI; el color es de VasakOS. Todo sale de
+`@vasakgroup/vue-libvasak` y de sus tokens, nunca de colores literales ni de la
+paleta de Tailwind.
 
-`WindowAppLayout` recibe el contenido en un `slot`, así que la aplicación va
-adentro:
+### Componentes
 
-```vue
-<WindowAppLayout>
-  <MiContenido />
-</WindowAppLayout>
-```
+Los botones, campos, tarjetas, estados vacíos, indicadores y diálogos salen de
+`@vasakgroup/vue-libvasak`; la aplicación no dibuja los suyos. Si falta uno, se
+suma **a la librería** (vue-libvasak#74). La pantalla de bienvenida usa
+`EmptyState` y `StatusDot`.
 
-Sin ese `slot` —que es como estaba— el layout **descartaba en silencio** todo lo
-que se le pusiera dentro y la ventana abría vacía con el relleno de la plantilla
-todavía puesto. No hay ningún error: simplemente no aparece nada, y en
-vasak-monitor costó una compilación y una captura darse cuenta.
+### Colores, radios y forma
 
-### Idioma de la sesión
+De `@vasakgroup/vue-libvasak/tokens.css`, que `main.css` importa después de
+Tailwind: los radios `rounded-corner-*` (derivados del radio que eligió la
+persona), los bordes `ui-line`, los velos de estado, las sombras `shadow-surface-*`
+y las curvas `ease-ui`. Los colores salen sólo del esquema (`bg-ui-surface/70`,
+`text-tx-main`), que pisa `tauri-plugin-config-manager`; ni hexadecimales, ni
+`rgb()`, ni la paleta de Tailwind. `tests/design-guard.test.ts` lo hace cumplir.
 
-`src-tauri/src/locales.rs` resuelve dos cosas que se rompen calladas:
-
-**Dónde están los catálogos.** El plugin sólo prueba rutas relativas al
-ejecutable y al directorio de trabajo, y **ninguna existe cuando el binario está
-en `/usr/bin`**. Sin la ruta explícita, un paquete instalado muestra las claves
-crudas (`inicio.titulo`) en lugar de los textos. Le pasó al gestor de archivos, a
-la terminal y a la galería.
-
-Al empaquetar, el PKGBUILD tiene que instalar los `.yml`:
-
-```bash
-install -dm755 "${pkgdir}/usr/share/${pkgname}/locales"
-install -Dm644 "$srcdir/$pkgname/src-tauri/locales/"*.yml \
-    "${pkgdir}/usr/share/${pkgname}/locales/"
-```
-
-**Qué idioma usar.** Se recorren `LC_ALL`, `LC_MESSAGES` y `LANG` en ese orden,
-**salteando las vacías**: `LC_ALL=""` junto a `LANG=en_US.UTF-8` es una máquina en
-inglés, y quedarse con la vacía la dejaría en español.
-
-### Escribir textos traducidos
-
-Todo texto que ve una persona va en los `.yml`. Nunca una cadena literal en un
-`.vue`.
-
-El `t()` del plugin toma **un solo argumento y no interpola**. La convención es el
-marcador `{0}` y `src/tools/interpolar.ts`:
-
-```ts
-import { interpolar } from '@/tools/interpolar';
-interpolar(t('inicio.saludo'), nombre);
-```
-
-**Usá el ayudante, no `replace` a mano.** `String.prototype.replace` interpreta
-`$&`, `$$`, `` $` `` y `$'` en la cadena de reemplazo: una canción llamada
-«Rock $& Roll» se mostraba como «Rock {0} Roll», y una con `$'` **perdía el texto
-que venía después**. Hay tests con los tres casos.
-
-Y no hay plurales: van dos claves con sufijo `One`/`Other` y la vista elige con
-`claveSegunCantidad()`. Sin eso se termina mostrando «1 pistas».
-
-Dos reglas de los `.yml`, las dos con test:
-
-1. **Si el valor contiene `: `, va entre comillas.** Sin ellas el parser lo lee
-   como un mapeo anidado, rompe el archivo entero y el plugin **paniquea al
-   arrancar**: la aplicación no abre. Pasó en producción.
-2. **Los idiomas tienen las mismas claves y los mismos marcadores.** Una clave que
-   falta se muestra cruda; un `{0}` que está en uno y no en el otro pierde el
-   dato.
-
-### Política de contenido
-
-`tauri.conf.json` trae una CSP con `script-src 'self'`, que es lo que bloquea la
-inyección de script. Si tu aplicación necesita algo más —una API externa en
-`connect-src`, `blob:` en `img-src`— agregalo ahí, **no la aflojes entera**.
-
-`style-src` lleva `'unsafe-inline'` a propósito: Vue escribe estilos en línea con
-`:style` y Tailwind inyecta los suyos. Esta política cubre script, no estilo.
-
-`main.ts` registra un reportador de violaciones. Hace falta porque **una violación
-de CSP no se ve**: el recurso no carga y la interfaz queda a medias sin decir
-nada. El reportador sanea las URLs antes de escribirlas —credenciales, query y
-fragmento fuera— porque ahí viajan tokens.
-
-Cuidado con las rutas absolutas de archivos: `file://` **no** está permitido, y
-está bien que no lo esté. Usá `convertFileSrc()`, que devuelve una URL del
-protocolo de assets.
-
-### Clic derecho
-
-`setupContextMenu({ iconResolver: getIconSource })` en `main.ts`. Sin eso, el
-clic derecho abre el menú del motor del navegador, con «Recargar» e «Inspeccionar
-elemento» — visiblemente ajeno al escritorio.
-
-### Tema y colores
-
-`useConfigStore()` del plugin de configuración, y `App.vue` escucha
-`config-changed` para que el cambio de tema se aplique sin reiniciar. Los colores
-salen de variables CSS (`--use-*`), no de valores fijos.
-
-### Componentes y forma
-
-Los botones, campos, tarjetas, menús, pestañas, globos y diálogos salen de
-`@vasakgroup/vue-libvasak`; una aplicación no dibuja los suyos. Si falta uno, se
-suma **a la librería**, con sus pruebas, y la aplicación lo consume
-(vue-libvasak#74, decisión 8 del taller).
-
-La forma —radios, bordes finos, sombras, estados, tiempos— viene de
-`@vasakgroup/vue-libvasak/tokens.css`, que `main.css` importa justo después de
-Tailwind. De ahí salen:
-
-- los radios `rounded-corner-xs`, `-s`, `-m`, `-l`, `-xl`, `-full` y `-window`,
-  todos derivados del radio que eligió la persona. Ni `rounded-md` ni un
-  `border-radius` en píxeles, ni los alias viejos `rounded-corner` y
-  `rounded-corner-sm`;
-- los bordes `ui-line-weak` / `ui-line`, los velos `ui-hover`, `ui-pressed`,
-  `ui-selected`, la superficie `ui-float` y el anillo `ui-focus`;
-- las sombras `shadow-surface-*`, los roles de texto `text-label-*`,
-  `text-body-*`, `text-heading-*` y las curvas `ease-ui` / `ease-ui-out`.
-
-Los colores salen sólo del esquema: ni hexadecimales, ni `rgb()`, ni la paleta
-de Tailwind (`gray-200`), ni siquiera en una sombra. Un tono derivado es un
-`color-mix()` sobre las variables del esquema. Los paneles y tarjetas van en
-`bg-ui-surface/70`; `bg-ui-bg` es sólo el fondo de la ventana. Sin
-`backdrop-blur`: las superficies son opacas.
-
-Lo que cambia con el ancho va con consultas de contenedor (`@container`,
-`@sm:`) o un `ResizeObserver`, **nunca** con `sm:`/`md:` ni `matchMedia`: un
-componente no sabe en qué ventana vive, y en WebKitGTK ni `matchMedia` ni
-`resize` avisan.
-
-`tests/design-guard.test.ts` hace cumplir todo esto y falla con el archivo y la
-clase culpable. Viene encendida en la plantilla para que cada aplicación nazca
-con ella.
+Lo que cambia con el ancho va con consultas de contenedor (`@container`, `@sm:`)
+o un `ResizeObserver`, **nunca** con `sm:`/`md:` ni `matchMedia`.
 
 ### Iconos
 
@@ -182,119 +89,61 @@ con ella.
 ruta: el pack de iconos cambia en caliente y sus rutas no son estables.
 
 ```vue
-<ThemeIcon name="internet-mail" :size="24" :alt="t('app.nombre')" />
+<ThemeIcon name="network-wireless" :size="24" :alt="t('app.nombre')" />
 <ThemeIcon name="view-refresh" type="symbol" :size="16" />
 ```
 
-`type` elige la variante: `icon` la común en color —la identidad de la ventana—
-y `symbol` la monocroma, que es la de los botones de acción. El `alt` va vacío
-por omisión, para cuando el icono acompaña a un texto que ya dice lo mismo;
-cuando el icono **es** la etiqueta, se pasa.
-
-La plantilla traía acá su propio `useReactiveIcon()`, y de ahí salieron nueve
-copias de noventa y una líneas repartidas por el taller. Todas resolvían el
-icono y se suscribían al cambio de tema **una vez por instancia**: en una
-ventana con veintiséis iconos eso eran veintiséis oyentes y veintiséis llamadas
-al backend. El de la librería memoriza lo resuelto y usa un solo oyente para
-todas.
+`type` elige la variante: `icon` la común en color y `symbol` la monocroma de los
+botones de acción.
 
 ---
+
+## Textos traducidos
+
+Todo texto que ve una persona va en `src-tauri/locales/{es,en}.yml`. Nunca una
+cadena literal en un `.vue`. El `t()` del plugin toma un solo argumento y no
+interpola: el marcador es `{0}` y se reemplaza con `src/tools/interpolar.ts`
+(nunca `String.replace` a mano — interpreta `$&`, `$'` y compañía).
+
+Dos reglas de los `.yml`, las dos con test: si el valor contiene `: ` va entre
+comillas, y los dos idiomas tienen las mismas claves y los mismos marcadores.
+
+## Política de contenido
+
+`tauri.conf.json` trae una CSP con `script-src 'self'`. Cuando el cliente de
+canal necesite hablar con el escritorio, se agrega ese origen a `connect-src`
+**ahí**, sin aflojar la política entera. `main.ts` registra un reportador de
+violaciones (saneando las URLs antes de escribirlas).
 
 ## Tests
 
-**Cada cambio va con tests, en el mismo commit.** Y si el repo tiene poca
-cobertura, se suman algunos de lo que está alrededor: así sube mientras se
-avanza, en lugar de necesitar una campaña de testing que nunca llega.
+**Cada cambio va con tests, en el mismo commit**, y la prueba tiene que fallar
+sin el cambio. Lo que conviene probar es lo que se rompe callado: parsers,
+recortes de texto, límites, marcadores de interpolación.
 
-Lo que conviene probar es **lo que se rompe callado**: parsers, recortes de
-texto, límites, entradas mal formadas, plurales, marcadores de interpolación. No
-la interfaz.
-
-La plantilla trae los dos lados armados:
-
-- `tests/interpolar.test.ts` — la interpolación, con los tres casos del `$`.
-- `tests/design-guard.test.ts` — la guardia del diseño: colores del esquema,
-  radios del sistema, iconos del tema, sin puntos de corte de la pantalla.
-- `src-tauri/tests/locales.rs` — que los catálogos parseen, tengan las mismas
-  claves, ningún texto vacío y los marcadores coincidan. Recorre el árbol
-  **completo**: cuando sólo bajaba dos niveles, un grupo anidado más abajo quedaba
-  sin comprobar y encima aparecía como texto vacío, porque un mapeo no es una
-  cadena — el test fallaba justo donde no miraba.
-- `src-tauri/src/locales.rs` — la detección de idioma.
-
-**Verificá que un test sirve reintroduciendo el bug a propósito** y viendo que
-falle. Un test que pasa siempre no prueba nada.
-
-Dos trampas al extraer lógica para poder probarla:
-
-- Separá el parseo de la I/O. Ese refactor es el que suele destapar el bug —así
-  apareció un panic por recortar UTF-8 por bytes en la terminal.
-- No dejes un `catch` vacío. Tragarse el error hace imposible saber si la llamada
-  llegó, y cuesta horas de diagnóstico.
-
----
-
-## Compilar y empaquetar
-
-```bash
-bun run lint          # biome
-bun test
-cargo test --manifest-path src-tauri/Cargo.toml
-bunx --bun tauri build
-```
-
-**Compilá siempre con `tauri build`, nunca con `cargo build --release` a secas.**
-Con `cargo` el binario queda apuntando al servidor de desarrollo: la página
-«carga» vacía, no ejecuta nada de JavaScript, y todo parece roto por otra razón.
-Perdí una tarde con eso.
-
-El PKGBUILD necesita, además de los `.yml` de arriba:
-
-- `options=('!lto')` — makepkg inyecta `-flto` global y los crates que compilan C
-  o assembly emiten bitcode que el enlazador de rustc no resuelve. Cargo ya hace
-  su propio LTO.
-- `RUSTFLAGS="-C target-cpu=x86-64"` y `unset CARGO_ENCODED_RUSTFLAGS` — el
-  `target-cpu=native` de la máquina que compila produce binarios que mueren con
-  SIGILL en cualquier CPU más vieja.
-
----
-
-## Rendimiento: lo que aprendimos a no hacer
-
-Estas aplicaciones corren en el escritorio de alguien, y su JavaScript comparte
-hilo con el dibujado. Un cálculo de 30 ms son dos cuadros perdidos.
-
-- **No sondees si podés escuchar.** Y si tenés que sondear, pausá con
-  `document.hidden`: nadie lee una pantalla que no está en pantalla.
-- **Un temporizador, no N.** Un `setInterval` por elemento se multiplica sin que
-  se note.
-- **Un reloj sin segundos despierta al minuto**, no a 1 Hz. 59 de cada 60
-  despertares no cambian un píxel, y `toLocaleTimeString` no es gratis.
-- **Lo pesado va en Rust.** Decodificar imágenes o video, hashear, recorrer
-  árboles de archivos: en el backend, y que cruce el IPC una ruta, no los bytes.
-- **No copies para notificar.** Un `{ ...objeto, clave: valor }` sobre un `ref`
-  reactivo copia todo el objeto en cada cambio; asignar la clave ya notifica.
-
----
+- `tests/design-guard.test.ts` — colores del esquema, radios del sistema, iconos
+  del tema, sin puntos de corte de la pantalla, la forma de Once UI.
+- `tests/identidad.test.ts` — los manifiestos dicen la misma versión y la misma
+  identidad móvil.
+- `tests/bienvenida.test.ts` — la primera pantalla monta.
+- `src-tauri/tests/locales.rs` — que los catálogos parseen y coincidan.
 
 ## Estructura
 
 ```
 src/
-  App.vue                 tema y configuración; el marco de la ventana
-  main.ts                 plugins, CSP, i18n, menú contextual
-  assets/main.css         Tailwind, `tokens.css` de la librería y las variables del tema
-  layouts/                WindowAppLayout
+  App.vue                 tema y configuración; monta la pantalla
+  main.ts                 plugins, CSP, i18n
+  assets/main.css         Tailwind, tokens.css de la librería y el piso del esquema
+  views/WelcomeScreen.vue la primera pantalla
   tools/interpolar.ts     interpolación y plurales de textos traducidos
-  tools/theme-cache.ts    recuerda el tema aplicado; `index.html` lo reaplica antes de montar
+  tools/theme-cache.ts    recuerda el tema aplicado
 tests/                    tests del frontend (bun test)
 src-tauri/
   src/lib.rs              registro de plugins
   src/locales.rs          resolución de idioma y de la ruta de catálogos
   locales/{es,en}.yml     los textos
-  tests/locales.rs        validación de los catálogos
-  capabilities/           permisos por ventana
-  tauri.conf.json         ventana, CSP, empaquetado
+  tauri.conf.json         identidad móvil, CSP
 ```
 
 ## Licencia

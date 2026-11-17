@@ -1,7 +1,7 @@
 [package]
-name = "vapp"
-version = "0.7.4"
-description = "A Vasak Application (template)"
+name = "vasak-connect-mobile"
+version = "0.1.0"
+description = "Compañero móvil de VasakOS: vincula el teléfono con el escritorio"
 authors = ["Vasak Group", "Joaquin (Pato) Decima"]
 edition = "2021"
 
@@ -11,7 +11,7 @@ edition = "2021"
 # The `_lib` suffix may seem redundant but it is necessary
 # to make the lib name unique and wouldn't conflict with the bin name.
 # This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
-name = "vapp_lib"
+name = "vasak_connect_mobile_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 # Para abrir la ventana compilada sin el servidor de desarrollo detrás.
@@ -39,17 +39,37 @@ tauri = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-# Los plugins del escritorio. Los cuatro, no dos: una app de VasakOS tiene que
-# hablar el idioma de la sesión y abrir el menú del sistema con el clic derecho.
-tauri-plugin-vicons = "2"
-tauri-plugin-config-manager = "2.13"
+# Los plugins que viajan a móvil: el idioma de la sesión y la consola del
+# sistema. El clic derecho (`vsk-contextual-menu`) y el diario de systemd
+# (`vsk-journal`) se quedaron en el escritorio: en un teléfono no hay clic
+# derecho ni journal, y sus crates no compilan para Android. El `gtk` de la
+# plantilla estaba sólo para mover la ventana sin decoración, que tampoco existe.
 tauri-plugin-i18n-vsk = "2.1.1"
-tauri-plugin-vsk-contextual-menu = "2"
 tauri-plugin-shell = "2"
 
-# Para la ventana sin decoración: la barra propia necesita mover y redimensionar.
-gtk = "0.18"
-tauri-plugin-vsk-journal = "2"
+# El contrato de red compartido con el daemon del escritorio (`vasak-connect`).
+# shortcut: por ahora sólo se declara la dependencia; el cliente de canal y el
+# pareo llegan en otro PR, contra el protocolo v2 (SAS/RFC-6189). La 0.6 es el
+# contrato D-Bus previo al pareo nuevo.
+vasak-connect-protocol = "0.6"
+
+# Plugins sólo de escritorio, porque sus crates no compilan para Android:
+#
+#  - `tauri-plugin-vicons` arrastra `gtk` en todos los targets (confirmado con
+#    `cargo tree -i gtk`: en Android es su única fuente), y en un teléfono no hay
+#    tema de iconos freedesktop que resolver.
+#  - `tauri-plugin-config-manager` 2.13 (la última) no compila para Android: usa
+#    su módulo `desktop` sin condicionarlo por plataforma (bug upstream). En
+#    móvil el esquema de color sale del piso de `main.css`, que ya son los
+#    colores por omisión de VasakOS.
+#
+# shortcut: el fix de verdad es hacer estos dos plugins mobile-ready upstream;
+# mientras tanto quedan sólo en escritorio (se registran condicional en `lib.rs`
+# y sus permisos van en la capability `desktop`). La fuente de iconos y la config
+# viva en móvil llegan en otro PR.
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tauri-plugin-vicons = "2"
+tauri-plugin-config-manager = "2.13"
 
 [dev-dependencies]
 # Sólo para el test que valida los catálogos de idioma: el plugin los parsea en

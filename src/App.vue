@@ -2,8 +2,9 @@
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { useConfigStore } from '@vasakgroup/plugin-config-manager';
 import { nextTick, onMounted, onUnmounted, type Ref, ref } from 'vue';
-import WindowAppLayout from '@/layouts/WindowAppLayout.vue';
+import { esMovil } from '@/tools/platform';
 import { saveTheme } from '@/tools/theme-cache';
+import WelcomeScreen from '@/views/WelcomeScreen.vue';
 
 let unListenConfig: Ref<UnlistenFn | null> = ref(null);
 
@@ -19,6 +20,16 @@ const configError = ref(false);
 onMounted(async () => {
 	// Que el layout se pinte primero, antes de cualquier lectura.
 	await nextTick();
+
+	// En móvil no hay `config-manager` (su crate no compila para Android; ver
+	// `src-tauri/Cargo.toml`), así que no se intenta leer la configuración: los
+	// colores salen del piso del esquema en `main.css` —los de VasakOS por
+	// omisión— hasta que el pareo traiga el esquema de la PC. Sin esto, cada
+	// arranque en el teléfono mostraría el banner de error de configuración.
+	if (esMovil()) {
+		configLoading.value = false;
+		return;
+	}
 
 	const configStore = useConfigStore();
 
@@ -61,5 +72,5 @@ onUnmounted(() => {
   <div v-else-if="configError" class="error-banner">
     Error al cargar configuración. Usando valores por defecto.
   </div>
-  <WindowAppLayout />
+  <WelcomeScreen />
 </template>

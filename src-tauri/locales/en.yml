@@ -1,11 +1,8 @@
 _version: 1
 app:
-  nombre: Vasak Application
-ventana:
-  minimizar: Minimise
-  maximizar: Maximise
-  cerrar: Close
+  nombre: Vasak Connect
 inicio:
-  titulo: Hello, VasakOS
-  descripcion: This is the template. Replace this screen with your own.
-  saludo: "Hello, {0}"
+  titulo: Vasak Connect
+  descripcion: The mobile companion for your VasakOS desktop. Pairing with your computer arrives in a future release.
+  estado:
+    sinVincular: Not paired
