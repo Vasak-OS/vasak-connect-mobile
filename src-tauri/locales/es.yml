@@ -12,14 +12,29 @@ app:
   nombre: Vasak Connect
 inicio:
   titulo: Vasak Connect
-  descripcion: El compañero móvil de tu escritorio VasakOS. El vínculo con tu equipo llega en una próxima versión.
+  descripcion: El compañero móvil de tu escritorio VasakOS. Vinculá el teléfono con tu equipo para empezar.
   estado:
     sinVincular: Sin vincular
+    vinculado: Vinculado
   descubiertos:
     titulo: Escritorios en tu red
     buscando: Buscando escritorios de VasakOS…
+    vincular: Vincular
+    vinculado: Vinculado
   tipo:
     phone: Teléfono
     tablet: Tablet
     desktop: Escritorio
     unknown: Dispositivo
+  sas:
+    titulo: Confirmá el código
+    conectando: Conectando con el escritorio…
+    instruccion: Verificá que este código sea el mismo que aparece en el escritorio.
+    aceptar: Coinciden
+    rechazar: No coinciden
+  resultado:
+    paired: Escritorio vinculado.
+    rejected_local: Rechazaste el código.
+    rejected_peer: El escritorio rechazó el vínculo.
+    aborted: El vínculo se interrumpió por seguridad. Probá de nuevo.
+    error: No se pudo completar el vínculo.

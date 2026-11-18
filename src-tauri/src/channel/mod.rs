@@ -1,26 +1,56 @@
 //! El canal teléfono↔escritorio del lado del teléfono.
 //!
-//! Por ahora: **descubrimiento**. Navega por mDNS los escritorios de VasakOS que
-//! se anuncian en la red y mantiene la lista para la interfaz. El TLS mutuo y el
-//! pareo (SAS/RFC-6189) llegan en el PR siguiente y reúsan la misma lógica pura
-//! del protocolo (`vasak_connect_protocol::pure`) que el daemon.
+//! Dos cosas: **descubrimiento** (navegar por mDNS los escritorios de VasakOS) y
+//! **pareo** (abrir el TLS mutuo con uno y fijar su huella tras confirmar el SAS).
+//! Toda la lógica que decide —framing, pinning, compromiso, derivación del SAS y
+//! la máquina de estados del pareo— es `vasak_connect_protocol::pure`, la misma
+//! que corre el daemon; acá vive el I/O (mDNS, TLS, DH, disco) y el puente con la
+//! interfaz.
+//!
+//! Este archivo tiene el **estado** del canal y la lógica que se puede prober sin
+//! una ventana ni una red. La capa que toca Tauri y los sockets —los comandos y la
+//! orquestación del pareo— vive en [`commands`], que la puerta de cobertura excluye
+//! (se verifica contra el servicio real, no con pruebas unitarias).
 
+mod commands;
 mod discovery;
+mod identity;
+mod pairing;
+mod store;
+mod transport;
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use mdns_sd::{ServiceDaemon, ServiceEvent};
-use tauri::{AppHandle, Emitter, Manager, State};
-use vasak_connect_protocol::wire::{PeerInfo, SERVICE_TYPE};
+use tokio::sync::oneshot;
+use vasak_connect_protocol::wire::PeerInfo;
 
 use discovery::Discovered;
+use identity::Identity;
+
+pub use commands::init;
+
+/// El nombre con el que el teléfono se presenta al escritorio (lo que la persona
+/// ve al confirmar el pareo).
+///
+/// shortcut: un nombre fijo. El nombre real del aparato (modelo, o el que puso la
+/// persona) necesita una API de plataforma (Android/iOS); va cuando el pareo esté
+/// andando en dispositivo.
+const SELF_NAME: &str = "Teléfono VasakOS";
 
 /// El evento que se emite cada vez que cambia la lista de escritorios vistos. La
 /// interfaz lo escucha y vuelve a pintar. El cuerpo es la lista completa (un
 /// `Vec<PeerInfo>`), no un delta: redibujar con la lista entera es más simple y
 /// la lista es chica.
 const PEERS_CHANGED: &str = "peers-changed";
+
+/// El SAS (código de seis dígitos) a mostrarle a la persona durante un pareo. La
+/// interfaz lo escucha, lo muestra y espera su confirmación (`pair_confirm`).
+const PAIRING_SAS: &str = "pairing-sas";
+
+/// Cómo terminó un pareo. La interfaz lo escucha para cerrar el diálogo del SAS.
+const PAIRING_RESULT: &str = "pairing-result";
 
 /// Estado del canal, administrado por Tauri. El `Mutex` alcanza: las operaciones
 /// son cortas (tomar el candado, mutar el mapa, soltar) y no hay `.await` adentro.
@@ -36,6 +66,18 @@ struct Inner {
     daemon: Option<ServiceDaemon>,
     /// Escritorios vistos, por `device_id`.
     peers: HashMap<String, Discovered>,
+    /// La identidad TLS del teléfono, cargada del disco la primera vez que hace
+    /// falta y cacheada (generarla es caro y tiene que ser estable entre pareos).
+    identity: Option<Arc<Identity>>,
+    /// Hay un pareo en curso (de `pair_request` hasta que termina). Es el guardia
+    /// de «uno a la vez»: se reserva ANTES de cargar la identidad y se libera recién
+    /// al terminar. Se lleva aparte de `pending_confirm` a propósito: `pair_confirm`
+    /// consume el `pending_confirm`, pero el pareo sigue vivo esperando al par, así
+    /// que el guardia no puede depender de que esa ranura siga ocupada.
+    pairing_active: bool,
+    /// El canal por el que `pair_confirm` le pasa la decisión de la persona al
+    /// pareo en curso. `Some` sólo mientras hay un pareo esperando confirmación.
+    pending_confirm: Option<oneshot::Sender<bool>>,
 }
 
 impl Inner {
@@ -61,54 +103,10 @@ fn snapshot(inner: &Inner) -> Vec<PeerInfo> {
     inner.peers.values().map(|d| d.peer.clone()).collect()
 }
 
-/// Empieza a navegar por mDNS. Idempotente: si ya hay un demonio, no abre otro.
-#[tauri::command]
-fn discovery_start(app: AppHandle, state: State<'_, ChannelState>) -> Result<(), String> {
-    let receiver = {
-        let mut inner = state.inner.lock().map_err(|_| "estado envenenado")?;
-        if inner.daemon.is_some() {
-            return Ok(());
-        }
-        let daemon = ServiceDaemon::new().map_err(|e| e.to_string())?;
-        let receiver = daemon.browse(SERVICE_TYPE).map_err(|e| e.to_string())?;
-        inner.daemon = Some(daemon);
-        receiver
-    };
-
-    let app = app.clone();
-    std::thread::spawn(move || {
-        // `recv` falla cuando el demonio se apaga (`discovery_stop`) y cierra el
-        // canal: ahí el hilo termina solo.
-        while let Ok(event) = receiver.recv() {
-            if apply_event(&app, event) {
-                if let Some(state) = app.try_state::<ChannelState>() {
-                    let list = {
-                        // Recuperar un candado envenenado en vez de `expect`: si un
-                        // tenedor paniqueó, el peor caso es una lista de
-                        // descubiertos a medio actualizar, no un invariante roto.
-                        // Paniquear acá mataría el hilo del browse y el
-                        // descubrimiento se apagaría en silencio.
-                        let inner = state.inner.lock().unwrap_or_else(|e| e.into_inner());
-                        snapshot(&inner)
-                    };
-                    let _ = app.emit(PEERS_CHANGED, list);
-                }
-            }
-        }
-    });
-
-    Ok(())
-}
-
 /// Aplica un evento del browse al estado. Devuelve `true` si la lista cambió (hay
-/// que reemitir), `false` si el evento no la tocó.
-fn apply_event(app: &AppHandle, event: ServiceEvent) -> bool {
-    let Some(state) = app.try_state::<ChannelState>() else {
-        return false;
-    };
-    // Recuperar un candado envenenado (ver el bucle del browse): no paniquear el
-    // hilo del descubrimiento por el estado de un tenedor anterior.
-    let mut inner = state.inner.lock().unwrap_or_else(|e| e.into_inner());
+/// que reemitir), `false` si el evento no la tocó. Puro sobre el estado: el hilo
+/// del browse toma el candado y llama acá.
+fn apply_event(inner: &mut Inner, event: ServiceEvent) -> bool {
     match event {
         ServiceEvent::ServiceResolved(info) => match discovery::resolved(&info) {
             Some(d) => inner.remember(d),
@@ -119,45 +117,6 @@ fn apply_event(app: &AppHandle, event: ServiceEvent) -> bool {
         ServiceEvent::ServiceRemoved(_, fullname) => inner.forget(&fullname),
         _ => false,
     }
-}
-
-/// Deja de navegar y olvida lo visto. Apagar el demonio cierra el browse y su
-/// hilo termina.
-#[tauri::command]
-fn discovery_stop(app: AppHandle, state: State<'_, ChannelState>) -> Result<(), String> {
-    {
-        let mut inner = state.inner.lock().map_err(|_| "estado envenenado")?;
-        if let Some(daemon) = inner.daemon.take() {
-            let _ = daemon.shutdown();
-        }
-        inner.peers.clear();
-    }
-    let _ = app.emit(PEERS_CHANGED, Vec::<PeerInfo>::new());
-    Ok(())
-}
-
-/// La lista actual de escritorios vistos, para que la interfaz pueda pedirla al
-/// montar sin esperar al primer evento.
-#[tauri::command]
-fn discovered_peers(state: State<'_, ChannelState>) -> Result<Vec<PeerInfo>, String> {
-    let inner = state.inner.lock().map_err(|_| "estado envenenado")?;
-    Ok(snapshot(&inner))
-}
-
-/// Registra el estado del canal y sus comandos en el `Builder`.
-///
-/// Concreto a `Wry` a propósito: `generate_handler!` genera envoltorios que
-/// resuelven `AppHandle` (= `AppHandle<Wry>`) contra un runtime concreto; dentro
-/// de una función genérica sobre `R` no casarían. La app usa `Wry` (ver
-/// `construir_app`), así que no se pierde nada.
-pub fn init(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wry> {
-    builder
-        .manage(ChannelState::default())
-        .invoke_handler(tauri::generate_handler![
-            discovery_start,
-            discovery_stop,
-            discovered_peers
-        ])
 }
 
 #[cfg(test)]
@@ -221,5 +180,25 @@ mod tests {
         // Un evento de salida de un servicio que nunca se vio: no hay que reemitir.
         assert!(!inner.forget("fantasma.local."));
         assert_eq!(snapshot(&inner).len(), 1);
+    }
+
+    #[test]
+    fn apply_event_saca_el_par_al_recibir_su_salida() {
+        let mut inner = Inner::default();
+        inner.remember(discovered("a", "a.local."));
+        let cambio = apply_event(
+            &mut inner,
+            ServiceEvent::ServiceRemoved("_vasakconnect._tcp.local.".into(), "a.local.".into()),
+        );
+        assert!(cambio);
+        assert!(snapshot(&inner).is_empty());
+    }
+
+    #[test]
+    fn apply_event_ignora_los_eventos_que_no_cambian_la_lista() {
+        let mut inner = Inner::default();
+        // `SearchStarted` no toca la lista de descubiertos.
+        let cambio = apply_event(&mut inner, ServiceEvent::SearchStarted("x".into()));
+        assert!(!cambio);
     }
 }

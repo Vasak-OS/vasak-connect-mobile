@@ -3,14 +3,29 @@ app:
   nombre: Vasak Connect
 inicio:
   titulo: Vasak Connect
-  descripcion: The mobile companion for your VasakOS desktop. Pairing with your computer arrives in a future release.
+  descripcion: The mobile companion for your VasakOS desktop. Pair your phone with your computer to get started.
   estado:
     sinVincular: Not paired
+    vinculado: Paired
   descubiertos:
     titulo: Desktops on your network
     buscando: Looking for VasakOS desktops…
+    vincular: Pair
+    vinculado: Paired
   tipo:
     phone: Phone
     tablet: Tablet
     desktop: Desktop
     unknown: Device
+  sas:
+    titulo: Confirm the code
+    conectando: Connecting to the desktop…
+    instruccion: Check that this code matches the one shown on the desktop.
+    aceptar: They match
+    rechazar: They differ
+  resultado:
+    paired: Desktop paired.
+    rejected_local: You rejected the code.
+    rejected_peer: The desktop rejected pairing.
+    aborted: Pairing was interrupted for safety. Try again.
+    error: Pairing could not be completed.

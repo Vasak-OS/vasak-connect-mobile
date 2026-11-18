@@ -1,6 +1,6 @@
 [package]
 name = "vasak-connect-mobile"
-version = "0.2.0"
+version = "0.3.0"
 description = "Compañero móvil de VasakOS: vincula el teléfono con el escritorio"
 authors = ["Vasak Group", "Joaquin (Pato) Decima"]
 edition = "2021"
@@ -56,9 +56,22 @@ tauri-plugin-shell = "2"
 vasak-connect-protocol = { version = "0.9", default-features = false }
 
 # Descubrimiento de escritorios por mDNS (el daemon anuncia `_vasakconnect._tcp`).
-# El parseo del registro TXT a `PeerInfo` lo hace `pure::parse_peer_txt`. El TLS y
-# el DH del pareo llegan en el PR siguiente (PR2b), con sus propias dependencias.
+# El parseo del registro TXT a `PeerInfo` lo hace `pure::parse_peer_txt`.
 mdns-sd = "0.13"
+
+# El pareo: TLS mutuo con certificados autofirmados y fijados, y el intercambio
+# Diffie-Hellman efímero (X25519) del SAS. Mismas versiones y mismo proveedor
+# cripto (`ring`) que el daemon, para que las dos puntas hablen igual. El
+# compromiso, la derivación del SAS y la máquina de estados NO se reimplementan:
+# salen de `vasak_connect_protocol::pure`.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+rustls-pki-types = "1"
+rcgen = "0.14"
+ring = "0.17"
+hex = "0.4"
+zeroize = "1"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "net", "io-util", "macros", "time", "fs"] }
 
 # Plugins sólo de escritorio, porque sus crates no compilan para Android:
 #
