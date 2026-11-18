@@ -9,7 +9,9 @@
 //! Igual que el pareo, la lógica que decide es `vasak_connect_protocol::pure`
 //! (pinning, `verify_hello`, `keepalive_exhausted`), y la sesión corre sobre
 //! canales —una tarea lee, otra escribe— para que sea cancel-safe y probable con un
-//! par en memoria, sin TLS.
+//! par en memoria, sin TLS. El establecimiento (`handshake`) y el bucle
+//! (`run_loop`) están separados para que quien llama avise «conectado» recién
+//! cuando la sesión quedó de verdad establecida, no antes.
 
 use std::time::Duration;
 
@@ -28,11 +30,22 @@ const KEEPALIVE: Duration = Duration::from_secs(30);
 /// Cuántos `Ping` seguidos sin `Pong` se toleran antes de dar la sesión por caída.
 const MAX_MISSED_PONGS: u32 = 2;
 
+/// Tope para el `Hello` inicial: un escritorio que completa el TLS pero no se
+/// presenta no puede dejar el `handshake` esperando para siempre (y con él el
+/// comando `sync_connect`, que la interfaz usa para saber si reintentar).
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Tope para un envío: el escritor escribe al socket sin plazo, así que si el par
+/// deja de leer, la cola de salida se llena y el envío se cuelga. Con este tope, un
+/// par que no lee se trata como caído en vez de trabar el bucle.
+const SEND_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Por qué terminó la sesión de sincronización.
 #[derive(Debug)]
 pub enum SyncError {
     Session(SessionError),
-    /// El `Hello` del escritorio no casa con el certificado TLS o la versión.
+    /// El `Hello` del escritorio no casa con el certificado TLS o la versión, o no
+    /// llegó a tiempo.
     Handshake(String),
     /// El certificado del escritorio no es el que se fijó al parear: no es nuestro
     /// par de confianza (o rotó su identidad). No se sincroniza con él.
@@ -57,20 +70,15 @@ impl From<SessionError> for SyncError {
     }
 }
 
-/// Corre la sesión de sincronización sobre una conexión ya abierta, hasta que el
-/// canal se cierra o el keepalive se agota.
-///
-/// `peer_fingerprint` es la huella del certificado que presentó el escritorio en
-/// este TLS; `pinned` es la que se fijó al parear. Se verifica que coincidan
-/// (confianza) y que el `Hello` case, antes de entrar al bucle de keepalive. `Ok`
-/// es un cierre ordinario (el par se fue o no respondió); `Err` es un problema del
-/// handshake o de confianza.
-pub async fn run(
+/// Establece la sesión: verifica que el certificado sea el fijado al parear
+/// (pinning), presenta el teléfono y recibe el `Hello` del escritorio —con tope de
+/// tiempo— validándolo. `Ok` significa sesión establecida y lista para el keepalive.
+pub async fn handshake(
     peer_fingerprint: &str,
     pinned: &str,
     own: &PeerInfo,
-    mut incoming: mpsc::Receiver<Result<Message, SessionError>>,
-    outgoing: mpsc::Sender<Message>,
+    incoming: &mut mpsc::Receiver<Result<Message, SessionError>>,
+    outgoing: &mpsc::Sender<Message>,
 ) -> Result<(), SyncError> {
     // El certificado tiene que ser el fijado al parear. Un par pareado que presenta
     // otra huella se rechaza (señal de suplantación o de identidad rotada).
@@ -78,17 +86,36 @@ pub async fn run(
         return Err(SyncError::NotTrusted);
     }
 
-    send(&outgoing, Message::Hello(own.clone())).await?;
-    let their = match recv(&mut incoming).await? {
-        Message::Hello(info) => info,
+    send(outgoing, Message::Hello(own.clone())).await?;
+    let their = match tokio::time::timeout(HANDSHAKE_TIMEOUT, recv(incoming)).await {
+        Ok(result) => result?,
+        Err(_) => {
+            return Err(SyncError::Handshake(
+                "el escritorio no se presentó a tiempo".into(),
+            ))
+        }
+    };
+    match their {
+        Message::Hello(info) => {
+            verify_hello(&info, peer_fingerprint)
+                .map_err(|e| SyncError::Handshake(e.to_string()))?;
+        }
         other => {
             return Err(SyncError::Handshake(format!(
                 "se esperaba Hello, llegó {other:?}"
             )))
         }
-    };
-    verify_hello(&their, peer_fingerprint).map_err(|e| SyncError::Handshake(e.to_string()))?;
+    }
+    Ok(())
+}
 
+/// Mantiene viva la sesión ya establecida con `Ping`/`Pong`, hasta que el canal se
+/// cierra o el keepalive se agota. `Ok` es un cierre ordinario (el par se fue o no
+/// respondió).
+pub async fn run_loop(
+    incoming: &mut mpsc::Receiver<Result<Message, SessionError>>,
+    outgoing: &mpsc::Sender<Message>,
+) -> Result<(), SyncError> {
     let mut keepalive = tokio::time::interval(KEEPALIVE);
     keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // El primer tick es inmediato: se consume para que el primer `Ping` salga recién
@@ -103,9 +130,8 @@ pub async fn run(
                     // Canal cerrado o error de sesión: cierre ordinario del bucle.
                     None | Some(Err(_)) => return Ok(()),
                     Some(Ok(Message::Pong)) => missed_pongs = 0,
-                    Some(Ok(Message::Ping)) => send(&outgoing, Message::Pong).await?,
-                    // Otros mensajes (batería/portapapeles) llegan en PRs siguientes;
-                    // por ahora se ignoran sin cerrar la sesión.
+                    Some(Ok(Message::Ping)) => send(outgoing, Message::Pong).await?,
+                    // Otros mensajes (batería/portapapeles) llegan en PRs siguientes.
                     Some(Ok(_)) => {}
                 }
             }
@@ -114,18 +140,20 @@ pub async fn run(
                 if keepalive_exhausted(missed_pongs, MAX_MISSED_PONGS) {
                     return Ok(());
                 }
-                send(&outgoing, Message::Ping).await?;
+                send(outgoing, Message::Ping).await?;
                 missed_pongs += 1;
             }
         }
     }
 }
 
+/// Manda un mensaje con tope de tiempo. El escritor ya no está, o la cola llena por
+/// un par que dejó de leer, se tratan igual: la sesión se cerró.
 async fn send(outgoing: &mpsc::Sender<Message>, message: Message) -> Result<(), SyncError> {
-    outgoing
-        .send(message)
-        .await
-        .map_err(|_| SyncError::Session(SessionError::Closed))
+    match tokio::time::timeout(SEND_TIMEOUT, outgoing.send(message)).await {
+        Ok(Ok(())) => Ok(()),
+        _ => Err(SyncError::Session(SessionError::Closed)),
+    }
 }
 
 async fn recv(
@@ -156,14 +184,14 @@ mod tests {
 
     #[tokio::test]
     async fn una_huella_que_no_es_la_fijada_no_sincroniza() {
-        let (_to_run_tx, to_run_rx) = mpsc::channel::<Result<Message, SessionError>>(4);
-        let (from_run_tx, _from_run_rx) = mpsc::channel::<Message>(4);
-        let err = run(
-            "OTRA:HUELLA",
+        let (_to, mut to_run_rx) = mpsc::channel::<Result<Message, SessionError>>(4);
+        let (from_run_tx, _from) = mpsc::channel::<Message>(4);
+        let err = handshake(
+            "OTRA",
             "FIJADA",
             &info("PH:ON:E"),
-            to_run_rx,
-            from_run_tx,
+            &mut to_run_rx,
+            &from_run_tx,
         )
         .await
         .unwrap_err();
@@ -171,34 +199,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn responde_el_ping_del_escritorio_con_pong() {
+    async fn el_handshake_valida_el_hello_del_escritorio() {
         let fp = "DE:SK";
-        let (to_run_tx, to_run_rx) = mpsc::channel::<Result<Message, SessionError>>(8);
-        let (from_run_tx, mut from_run_rx) = mpsc::channel::<Message>(8);
-
-        // Escritorio: contesta el Hello, manda un Ping y después cierra.
+        let (to_run_tx, mut to_run_rx) = mpsc::channel::<Result<Message, SessionError>>(4);
+        let (from_run_tx, mut from_run_rx) = mpsc::channel::<Message>(4);
         to_run_tx.send(Ok(Message::Hello(info(fp)))).await.unwrap();
-        to_run_tx.send(Ok(Message::Ping)).await.unwrap();
-        drop(to_run_tx); // cierra el canal → la sesión termina ordenada
 
-        run(fp, fp, &info("PH:ON:E"), to_run_rx, from_run_tx)
+        handshake(fp, fp, &info("PH:ON:E"), &mut to_run_rx, &from_run_tx)
             .await
             .unwrap();
-
-        // Lo que mandó el teléfono: su Hello y el Pong a nuestro Ping.
+        // El teléfono se presentó.
         assert!(matches!(from_run_rx.recv().await, Some(Message::Hello(_))));
-        assert_eq!(from_run_rx.recv().await, Some(Message::Pong));
     }
 
     #[tokio::test]
-    async fn un_hello_que_no_es_hello_es_error_de_handshake() {
+    async fn un_primer_mensaje_que_no_es_hello_es_error_de_handshake() {
         let fp = "DE:SK";
-        let (to_run_tx, to_run_rx) = mpsc::channel::<Result<Message, SessionError>>(4);
-        let (from_run_tx, _from_run_rx) = mpsc::channel::<Message>(4);
+        let (to_run_tx, mut to_run_rx) = mpsc::channel::<Result<Message, SessionError>>(4);
+        let (from_run_tx, _from) = mpsc::channel::<Message>(4);
         to_run_tx.send(Ok(Message::Ping)).await.unwrap(); // no es Hello
-        let err = run(fp, fp, &info("PH:ON:E"), to_run_rx, from_run_tx)
+        let err = handshake(fp, fp, &info("PH:ON:E"), &mut to_run_rx, &from_run_tx)
             .await
             .unwrap_err();
         assert!(matches!(err, SyncError::Handshake(_)));
+    }
+
+    #[tokio::test]
+    async fn el_bucle_responde_el_ping_con_pong_y_cierra_al_cerrarse_el_canal() {
+        let (to_run_tx, mut to_run_rx) = mpsc::channel::<Result<Message, SessionError>>(4);
+        let (from_run_tx, mut from_run_rx) = mpsc::channel::<Message>(4);
+        to_run_tx.send(Ok(Message::Ping)).await.unwrap();
+        drop(to_run_tx); // cierra el canal → el bucle termina ordenado
+
+        run_loop(&mut to_run_rx, &from_run_tx).await.unwrap();
+        assert_eq!(from_run_rx.recv().await, Some(Message::Pong));
     }
 }

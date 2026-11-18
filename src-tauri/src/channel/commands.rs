@@ -30,6 +30,10 @@ use super::{
 /// sin esto `pairing_active` quedaría tomado y todo pareo posterior fallaría.
 const PAIRING_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Tope para abrir el TCP + TLS al reconectar para sincronizar. Separado de la vida
+/// de la sesión: acota sólo el establecimiento, no la sesión ya viva.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
 // ── Descubrimiento ───────────────────────────────────────────────────────────
 
 /// Empieza a navegar por mDNS. Idempotente: si ya hay un demonio, no abre otro.
@@ -411,12 +415,16 @@ async fn sync_connect(
         fingerprint: identity.fingerprint.clone(),
     };
 
-    let session = Session::connect(addr, &identity)
-        .await
-        .map_err(|e| e.to_string())?;
+    // Con tope de tiempo: un escritorio que acepta el TCP pero no completa el TLS no
+    // puede dejar el intento colgado (ni a la interfaz esperándolo).
+    let session =
+        match tokio::time::timeout(CONNECT_TIMEOUT, Session::connect(addr, &identity)).await {
+            Ok(result) => result.map_err(|e| e.to_string())?,
+            Err(_) => return Err("el escritorio no respondió al conectar".to_string()),
+        };
     let peer_fingerprint = session.peer_fingerprint().to_string();
     let (read_half, write_half) = session.split();
-    let (in_tx, in_rx) = mpsc::channel::<Result<Message, SessionError>>(16);
+    let (in_tx, mut in_rx) = mpsc::channel::<Result<Message, SessionError>>(16);
     let (out_tx, out_rx) = mpsc::channel::<Message>(16);
     // El guard aborta las tareas al volver (termine o falle la sesión), igual que en
     // el pareo: nada queda colgado leyendo de un escritorio callado.
@@ -425,6 +433,13 @@ async fn sync_connect(
         tauri::async_runtime::spawn(transport::writer_loop(write_half, out_rx)),
     );
 
+    // Establecer la sesión (pinning + Hello, con tope de tiempo). Si falla, se vuelve
+    // sin avisar «conectado»: la interfaz no muestra un estado falso.
+    sync::handshake(&peer_fingerprint, &pinned, &own, &mut in_rx, &out_tx)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // Recién con la sesión establecida se avisa «conectado».
     let _ = app.emit(
         SYNC_STATUS,
         SyncStatusPayload {
@@ -432,7 +447,7 @@ async fn sync_connect(
             connected: true,
         },
     );
-    let result = sync::run(&peer_fingerprint, &pinned, &own, in_rx, out_tx).await;
+    let result = sync::run_loop(&mut in_rx, &out_tx).await;
     let _ = app.emit(
         SYNC_STATUS,
         SyncStatusPayload {

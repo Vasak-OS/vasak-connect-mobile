@@ -101,23 +101,39 @@ async function confirm(accept: boolean): Promise<void> {
 const connected = ref<string[]>([]);
 /** Los pareos para los que ya hay un `sync_connect` en vuelo, para no lanzar dos. */
 const connecting = new Set<string>();
+/** Escritorios que reaparecieron mientras su intento anterior seguía cerrándose:
+ * se reconectan en cuanto ese intento termina. */
+const pendingReconnect = new Set<string>();
 
 /**
  * Asegura una sesión de sync con un escritorio vinculado y presente: si no hay una
  * en vuelo, abre `sync_connect` (comando de larga duración). Su promesa se resuelve
- * al cortarse la sesión; ahí se libera la marca para poder reconectar cuando el
- * escritorio se vuelva a descubrir. Sin reintento inmediato a propósito, para no
- * entrar en un bucle si el escritorio rechaza.
+ * al cortarse la sesión. Si el escritorio se redescubre mientras el intento anterior
+ * todavía se está cerrando, se anota y se reconecta al terminar —así una
+ * desaparición/reaparición rápida no se pierde—. Sin reintento inmediato cuando NO
+ * hubo redescubrimiento, a propósito, para no entrar en bucle si el escritorio rechaza.
  */
 function ensureSync(peer: Peer): void {
 	const id = peer.device_id;
-	if (!pairedIds.value.has(id) || connecting.has(id)) {
+	if (!pairedIds.value.has(id)) {
+		return;
+	}
+	if (connecting.has(id)) {
+		pendingReconnect.add(id);
 		return;
 	}
 	connecting.add(id);
 	invoke('sync_connect', { deviceId: id })
 		.catch((error) => console.error('La sesión de sincronización terminó', error))
-		.finally(() => connecting.delete(id));
+		.finally(() => {
+			connecting.delete(id);
+			if (pendingReconnect.delete(id)) {
+				const presente = peers.value.find((p) => p.device_id === id);
+				if (presente !== undefined) {
+					ensureSync(presente);
+				}
+			}
+		});
 }
 
 /** Intenta sincronizar con cada escritorio descubierto que esté vinculado. */
