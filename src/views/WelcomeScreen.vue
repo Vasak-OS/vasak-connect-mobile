@@ -136,10 +136,26 @@ function ensureSync(peer: Peer): void {
 		});
 }
 
-/** Intenta sincronizar con cada escritorio descubierto que esté vinculado. */
-function syncDiscoveredPaired(): void {
+/** Los `device_id` presentes en la última lista de descubiertos, para distinguir
+ * los que REAPARECEN de los que sólo siguen ahí. */
+const seenIds = new Set<string>();
+
+/**
+ * Sincroniza con los escritorios que **acaban de aparecer** (no estaban en la lista
+ * anterior). `peers-changed` trae la lista entera, así que llamar a `ensureSync`
+ * para todos marcaría a uno conectado para reintento cada vez que cambia otro; sólo
+ * los que reaparecen disparan la sincronización (y, si reaparecen durante un intento
+ * en vuelo, su reconexión).
+ */
+function syncAppeared(): void {
 	for (const peer of peers.value) {
-		ensureSync(peer);
+		if (!seenIds.has(peer.device_id)) {
+			ensureSync(peer);
+		}
+	}
+	seenIds.clear();
+	for (const peer of peers.value) {
+		seenIds.add(peer.device_id);
 	}
 }
 
@@ -148,7 +164,7 @@ onMounted(async () => {
 		await escuchar<Peer[]>('peers-changed', (payload) => {
 			peers.value = payload ?? [];
 			// Apenas aparece un escritorio, si está vinculado se intenta sincronizar.
-			syncDiscoveredPaired();
+			syncAppeared();
 		});
 		await escuchar<string>('pairing-sas', (payload) => {
 			if (pairing.value !== null) {
@@ -159,8 +175,16 @@ onMounted(async () => {
 			pairing.value = null;
 			result.value = payload;
 			if (payload.status === 'paired') {
+				const id = payload.device_id;
 				refreshPaired()
-					.then(() => syncDiscoveredPaired())
+					.then(() => {
+						// El escritorio recién vinculado ya estaba descubierto, así que
+						// `syncAppeared` no lo tomaría (no es «nuevo»): se conecta directo.
+						const peer = peers.value.find((p) => p.device_id === id);
+						if (peer !== undefined) {
+							ensureSync(peer);
+						}
+					})
 					.catch((error) => console.error('No se pudo refrescar los vinculados', error));
 			}
 		});
@@ -180,7 +204,7 @@ onMounted(async () => {
 
 		peers.value = (await invoke<Peer[]>('discovered_peers')) ?? [];
 		await refreshPaired();
-		syncDiscoveredPaired();
+		syncAppeared();
 	} catch (error) {
 		console.error('No se pudo iniciar el descubrimiento', error);
 		// Si el arranque falló a mitad, soltar los oyentes que sí se registraron:
