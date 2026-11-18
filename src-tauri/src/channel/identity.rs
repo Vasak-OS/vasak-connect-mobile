@@ -110,18 +110,30 @@ fn decode(blob: &[u8]) -> Option<(Vec<u8>, Zeroizing<Vec<u8>>)> {
     Some((cert, Zeroizing::new(key)))
 }
 
+/// La clave parsea como una clave de firma que el proveedor `ring` soporta. Atrapa
+/// una clave truncada o corrupta —que `decode` no puede ver por el largo, porque no
+/// lo guarda— antes de dársela a rustls, donde fallaría en cada handshake. La
+/// correspondencia clave↔certificado la garantiza el archivo único atómico: los dos
+/// salen siempre de la misma `generate`.
+fn key_is_usable(key_pkcs8_der: &[u8]) -> bool {
+    let der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pkcs8_der.to_vec()));
+    rustls::crypto::ring::sign::any_supported_type(&der).is_ok()
+}
+
 /// Carga la identidad del dir dado, o la crea y la guarda si falta o está rota.
 ///
 /// El par vive en un solo archivo escrito de forma atómica (temporal + `rename`):
-/// o está entero y consistente, o no está. Un blob truncado o mal formado (de una
-/// escritura vieja interrumpida, o basura) no se carga: se regenera. Así nunca se
-/// usa un certificado a medias ni una clave que no corresponde al certificado.
+/// o está entero y consistente, o no está. Un blob truncado o mal formado, o con una
+/// clave que no parsea, no se carga: se regenera. Así nunca se usa un certificado a
+/// medias ni una clave inválida o que no corresponde al certificado.
 pub async fn load_or_create(dir: &Path) -> Result<Identity, IdentityError> {
     let path = dir.join(IDENTITY_FILE);
 
     if let Ok(blob) = tokio::fs::read(&path).await {
         if let Some((cert, key)) = decode(&blob) {
-            return Ok(Identity::from_parts(cert, key));
+            if key_is_usable(&key) {
+                return Ok(Identity::from_parts(cert, key));
+            }
         }
     }
 
@@ -214,5 +226,13 @@ mod tests {
         assert!(decode(&blob[..6]).is_none());
         // Sin siquiera la cabecera de largo.
         assert!(decode(b"xy").is_none());
+    }
+
+    #[test]
+    fn una_clave_generada_es_usable_y_una_basura_no() {
+        let (_, key) = generate().unwrap();
+        assert!(key_is_usable(&key));
+        // Bytes que no son una clave PKCS8: no debería aceptarse.
+        assert!(!key_is_usable(b"no soy una clave"));
     }
 }

@@ -32,11 +32,9 @@ inicio:
     instruccion: Verificá que este código sea el mismo que aparece en el escritorio.
     aceptar: Coinciden
     rechazar: No coinciden
-    cancelar: Cancelar
   resultado:
     paired: Escritorio vinculado.
     rejected_local: Rechazaste el código.
     rejected_peer: El escritorio rechazó el vínculo.
     aborted: El vínculo se interrumpió por seguridad. Probá de nuevo.
-    cancelled: Se canceló el vínculo.
     error: No se pudo completar el vínculo.

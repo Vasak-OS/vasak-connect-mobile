@@ -39,7 +39,7 @@ interface PairedPeer {
 /** Cómo terminó un pareo, igual que `PairingResultPayload` de Rust. */
 interface PairingResult {
 	device_id: string;
-	status: 'paired' | 'rejected_local' | 'rejected_peer' | 'aborted' | 'cancelled' | 'error';
+	status: 'paired' | 'rejected_local' | 'rejected_peer' | 'aborted' | 'error';
 	message: string | null;
 }
 
@@ -94,16 +94,6 @@ async function confirm(accept: boolean): Promise<void> {
 		await invoke('pair_confirm', { accept });
 	} catch (error) {
 		console.error('No se pudo enviar la confirmación', error);
-	}
-}
-
-/** Cancela el pareo en curso (sobre todo mientras conecta, cuando no hay SAS que
- * rechazar). El cartel de resultado llega por el evento `pairing-result`. */
-async function cancel(): Promise<void> {
-	try {
-		await invoke('pair_cancel');
-	} catch (error) {
-		console.error('No se pudo cancelar el pareo', error);
 	}
 }
 
@@ -236,15 +226,11 @@ onUnmounted(() => {
           {{ t('inicio.sas.titulo') }}
         </h2>
 
-        <template v-if="pairing.sas === null">
-          <p class="py-4 text-center text-tx-muted">{{ t('inicio.sas.conectando') }}</p>
-          <button
-            type="button"
-            class="w-full rounded-corner-m bg-ui-surface px-4 py-2 text-sm font-medium text-tx-main shadow-surface-s transition-opacity hover:opacity-90"
-            @click="cancel">
-            {{ t('inicio.sas.cancelar') }}
-          </button>
-        </template>
+        <p
+          v-if="pairing.sas === null"
+          class="py-4 text-center text-tx-muted">
+          {{ t('inicio.sas.conectando') }}
+        </p>
 
         <template v-else>
           <p class="text-center text-sm text-tx-muted">{{ t('inicio.sas.instruccion') }}</p>

@@ -131,7 +131,6 @@ fn release_pairing(state: &State<'_, ChannelState>) {
     if let Ok(mut inner) = state.inner.lock() {
         inner.pairing_active = false;
         inner.pending_confirm = None;
-        inner.pairing_task = None;
     }
 }
 
@@ -214,8 +213,10 @@ async fn pair_request(
         }
     };
     let app_task = app.clone();
-    let task = tauri::async_runtime::spawn(async move {
-        // Con tope de tiempo: un par que nunca completa no bloquea el canal (C10).
+    tauri::async_runtime::spawn(async move {
+        // Con tope de tiempo: un par que acepta el TCP pero no completa (o se queda
+        // callado) no bloquea el canal para siempre (C10). Al vencer, `pair_session`
+        // se descarta y su guard `AbortWorkers` corta las tareas lectora/escritora.
         let outcome = match tokio::time::timeout(
             PAIRING_TIMEOUT,
             pair_session(
@@ -237,36 +238,24 @@ async fn pair_request(
         let _ = forwarder.await;
         finish_pairing(&app_task, &dir, &device_id, outcome).await;
     });
-    // Guardar el handle para poder cancelar el intento (`pair_cancel`).
-    if let Ok(mut inner) = state.inner.lock() {
-        inner.pairing_task = Some(task);
-    }
 
     Ok(())
 }
 
-/// Cancela el pareo en curso: aborta la tarea, libera el guardia y avisa a la
-/// interfaz. Para cuando la persona cierra el diálogo mientras se conecta —antes de
-/// que haya un SAS que rechazar—. No falla si no hay nada que cancelar.
-#[tauri::command]
-fn pair_cancel(app: AppHandle, state: State<'_, ChannelState>) -> Result<(), String> {
-    let task = {
-        let mut inner = state.inner.lock().map_err(|_| "estado envenenado")?;
-        inner.pairing_task.take()
-    };
-    if let Some(task) = task {
-        task.abort();
+/// Aborta las tareas lectora y escritora al soltarse. Soltar un `JoinHandle`
+/// **desacopla** la tarea (no la frena): sin esto, cuando `pair_session` termina o
+/// se descarta por el tope de tiempo, la tarea lectora quedaría colgada en
+/// `read_frame` esperando a un escritorio callado, reteniendo la tarea y el socket.
+struct AbortWorkers(
+    tauri::async_runtime::JoinHandle<()>,
+    tauri::async_runtime::JoinHandle<()>,
+);
+
+impl Drop for AbortWorkers {
+    fn drop(&mut self) {
+        self.0.abort();
+        self.1.abort();
     }
-    release_pairing(&state);
-    let _ = app.emit(
-        PAIRING_RESULT,
-        PairingResultPayload {
-            device_id: String::new(),
-            status: "cancelled",
-            message: None,
-        },
-    );
-    Ok(())
 }
 
 /// Abre el TLS, parte la sesión en una tarea lectora y una escritora, y corre el
@@ -296,8 +285,13 @@ async fn pair_session(
 
     let (in_tx, in_rx) = mpsc::channel::<Result<Message, SessionError>>(16);
     let (out_tx, out_rx) = mpsc::channel::<Message>(16);
-    tauri::async_runtime::spawn(transport::reader_loop(read_half, in_tx));
-    tauri::async_runtime::spawn(transport::writer_loop(write_half, out_rx));
+    // El guard aborta las dos tareas al salir de esta función —termine, falle o la
+    // descarte el tope de tiempo—, para no dejar a la lectora colgada en una lectura
+    // de un escritorio callado.
+    let _workers = AbortWorkers(
+        tauri::async_runtime::spawn(transport::reader_loop(read_half, in_tx)),
+        tauri::async_runtime::spawn(transport::writer_loop(write_half, out_rx)),
+    );
 
     pairing::run(&peer_fingerprint, &own, in_rx, out_tx, sas_tx, confirm_rx)
         .await
@@ -353,7 +347,6 @@ async fn finish_pairing(
         if let Ok(mut inner) = state.inner.lock() {
             inner.pairing_active = false;
             inner.pending_confirm = None;
-            inner.pairing_task = None;
         }
     }
 }
@@ -392,7 +385,6 @@ pub fn init(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wry> {
             discovered_peers,
             pair_request,
             pair_confirm,
-            pair_cancel,
             paired_peers
         ])
 }
