@@ -17,9 +17,10 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 use vasak_connect_protocol::pure::{
-    accept_incoming_clipboard, evaluate_peer_cert, keepalive_exhausted, verify_hello, TrustDecision,
+    accept_incoming_clipboard, evaluate_peer_cert, keepalive_exhausted, verify_hello,
+    TrustDecision, MAX_FRAME,
 };
-use vasak_connect_protocol::wire::{Message, PeerInfo};
+use vasak_connect_protocol::wire::{encode, Message, PeerInfo};
 
 use super::transport::SessionError;
 
@@ -193,7 +194,15 @@ pub async fn run_loop(
                 // sincronizado y no está vacío, se empuja al escritorio.
                 if let Some(text) = clipboard.read() {
                     if !text.is_empty() && last_synced.as_deref() != Some(text.as_str()) {
-                        send(outgoing, Message::Clipboard { text: text.clone() }).await?;
+                        let message = Message::Clipboard { text: text.clone() };
+                        // Un marco sobre MAX_FRAME lo rechaza el lector del escritorio
+                        // y con eso cierra la sesión: un texto enorme (el JSON escapa,
+                        // así que `text.len()` no alcanza) se descarta en vez de cortar
+                        // el sync. Se marca sincronizado igual para no reintentarlo a
+                        // cada sondeo.
+                        if encode(&message).len() <= MAX_FRAME {
+                            send(outgoing, message).await?;
+                        }
                         last_synced = Some(text);
                     }
                 }
@@ -443,5 +452,37 @@ mod tests {
                                                            // Si se hubiera marcado "nuevo" como sincronizado, el sondeo vería "viejo"
                                                            // como un cambio local y lo empujaría de vuelta al escritorio.
         assert!(salida.is_empty(), "no debe rebotar el viejo: {salida:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn un_texto_que_codificado_pasa_el_tope_del_marco_no_se_envia() {
+        // Crudo pesa 700 000 bytes (< 1 MiB), pero cada comilla se escapa y el JSON
+        // pasa MAX_FRAME: el lector del escritorio lo rechazaría y cerraría la sesión.
+        let enorme = "\"".repeat(700_000);
+        assert!(encode(&clip_msg(&enorme)).len() > MAX_FRAME);
+        let clip = FakeClipboard::default();
+        let c = &clip;
+        let salida = correr(&clip, |tx| async move {
+            c.set(&enorme);
+            tokio::time::sleep(UN_SONDEO * 3).await; // y tampoco se reintenta
+            drop(tx);
+        })
+        .await;
+        assert!(salida.is_empty(), "no debe enviarse un marco enorme");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn un_texto_grande_dentro_del_tope_del_marco_si_se_envia() {
+        let grande = "\"".repeat(500_000); // ~1 000 000 bytes codificado
+        assert!(encode(&clip_msg(&grande)).len() <= MAX_FRAME);
+        let clip = FakeClipboard::default();
+        let c = &clip;
+        let salida = correr(&clip, |tx| async move {
+            c.set(&grande);
+            tokio::time::sleep(UN_SONDEO).await;
+            drop(tx);
+        })
+        .await;
+        assert_eq!(salida.len(), 1);
     }
 }

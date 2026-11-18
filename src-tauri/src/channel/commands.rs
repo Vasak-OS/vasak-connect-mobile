@@ -387,6 +387,11 @@ struct SyncStatusPayload {
 /// conocer Tauri. Envuelve el plugin `clipboard-manager` con el `AppHandle`.
 /// `read` trata el portapapeles vacío o ilegible como «nada» (`None`); `write` es
 /// de mejor esfuerzo: un fallo del plugin no debe cortar la sesión.
+///
+/// Límite de plataforma: en Android 10+ el sistema sólo deja leer el portapapeles
+/// con la app en primer plano, así que la dirección teléfono→escritorio funciona
+/// mientras la app está al frente. El soporte en segundo plano necesitaría un
+/// servicio de accesibilidad y queda para un PR siguiente.
 struct AppClipboard {
     app: AppHandle,
 }
