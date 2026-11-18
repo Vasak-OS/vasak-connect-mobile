@@ -31,7 +31,11 @@ fn construir_app() -> tauri::Builder<tauri::Wry> {
             Some(locales::idioma_del_sistema()),
             locales::directorio(),
         ))
-        .plugin(tauri_plugin_shell::init());
+        .plugin(tauri_plugin_shell::init())
+        // El portapapeles del teléfono, para espejarlo con el del escritorio por el
+        // canal. El plugin oficial anda en móvil y escritorio, así que va en la
+        // cadena común, no en el bloque sólo-escritorio.
+        .plugin(tauri_plugin_clipboard_manager::init());
 
     // Plugins sólo de escritorio: sus crates no compilan para Android (ver
     // `Cargo.toml`). `vicons` arrastra `gtk`, y `config-manager` 2.13 usa su

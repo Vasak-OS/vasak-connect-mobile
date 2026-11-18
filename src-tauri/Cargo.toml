@@ -1,6 +1,6 @@
 [package]
 name = "vasak-connect-mobile"
-version = "0.4.0"
+version = "0.5.0"
 description = "Compañero móvil de VasakOS: vincula el teléfono con el escritorio"
 authors = ["Vasak Group", "Joaquin (Pato) Decima"]
 edition = "2021"
@@ -46,6 +46,9 @@ serde_json = "1"
 # plantilla estaba sólo para mover la ventana sin decoración, que tampoco existe.
 tauri-plugin-i18n-vsk = "2.1.1"
 tauri-plugin-shell = "2"
+# El portapapeles del teléfono (lee/escribe texto), para espejarlo con el del
+# escritorio por el canal. Oficial, compila para Android/iOS.
+tauri-plugin-clipboard-manager = "2"
 
 # El contrato de red y la lógica pura del canal, compartidos con el daemon del
 # escritorio (`vasak-connect`). `default-features = false` deja afuera el contrato
@@ -96,6 +99,9 @@ tauri-plugin-config-manager = "2.13"
 # tiempo de ejecución y **paniquea** si no puede, así que un error de sintaxis no
 # se ve hasta que la aplicación no arranca.
 serde_yaml = "0.9"
+# Reloj pausable (`start_paused`) para disparar el sondeo del portapapeles sin
+# esperar segundos reales.
+tokio = { version = "1", features = ["test-util"] }
 
 [profile.dev]
 incremental = true # Compile your binary in smaller steps.

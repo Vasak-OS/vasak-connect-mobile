@@ -14,6 +14,7 @@ use std::time::Duration;
 use mdns_sd::ServiceDaemon;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
+use tauri_plugin_clipboard_manager::ClipboardExt;
 use tokio::sync::{mpsc, oneshot};
 use vasak_connect_protocol::wire::{DeviceKind, Message, PeerInfo, PROTOCOL_VERSION, SERVICE_TYPE};
 
@@ -382,6 +383,32 @@ struct SyncStatusPayload {
     connected: bool,
 }
 
+/// El portapapeles real del teléfono, para que [`sync::run_loop`] sincronice sin
+/// conocer Tauri. Envuelve el plugin `clipboard-manager` con el `AppHandle`.
+/// `read` trata el portapapeles vacío o ilegible como «nada» (`None`); `write` es
+/// de mejor esfuerzo: un fallo del plugin no debe cortar la sesión.
+///
+/// Límite de plataforma: en Android 10+ el sistema sólo deja leer el portapapeles
+/// con la app en primer plano, así que la dirección teléfono→escritorio funciona
+/// mientras la app está al frente. El soporte en segundo plano necesitaría un
+/// servicio de accesibilidad y queda para un PR siguiente.
+struct AppClipboard {
+    app: AppHandle,
+}
+
+impl sync::Clipboard for AppClipboard {
+    fn read(&self) -> Option<String> {
+        self.app
+            .clipboard()
+            .read_text()
+            .ok()
+            .filter(|t| !t.is_empty())
+    }
+    fn write(&self, text: &str) -> bool {
+        self.app.clipboard().write_text(text.to_string()).is_ok()
+    }
+}
+
 /// Conecta con un escritorio **ya pareado y descubierto** y mantiene viva la sesión
 /// (keepalive) hasta que se cae. Es un comando de larga duración: su promesa queda
 /// pendiente mientras la sesión está viva y se resuelve al cortarse, así la interfaz
@@ -447,7 +474,8 @@ async fn sync_connect(
             connected: true,
         },
     );
-    let result = sync::run_loop(&mut in_rx, &out_tx).await;
+    let clipboard = AppClipboard { app: app.clone() };
+    let result = sync::run_loop(&mut in_rx, &out_tx, &clipboard).await;
     let _ = app.emit(
         SYNC_STATUS,
         SyncStatusPayload {
