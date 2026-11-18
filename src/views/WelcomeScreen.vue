@@ -101,61 +101,29 @@ async function confirm(accept: boolean): Promise<void> {
 const connected = ref<string[]>([]);
 /** Los pareos para los que ya hay un `sync_connect` en vuelo, para no lanzar dos. */
 const connecting = new Set<string>();
-/** Escritorios que reaparecieron mientras su intento anterior seguía cerrándose:
- * se reconectan en cuanto ese intento termina. */
-const pendingReconnect = new Set<string>();
 
 /**
- * Asegura una sesión de sync con un escritorio vinculado y presente: si no hay una
- * en vuelo, abre `sync_connect` (comando de larga duración). Su promesa se resuelve
- * al cortarse la sesión. Si el escritorio se redescubre mientras el intento anterior
- * todavía se está cerrando, se anota y se reconecta al terminar —así una
- * desaparición/reaparición rápida no se pierde—. Sin reintento inmediato cuando NO
- * hubo redescubrimiento, a propósito, para no entrar en bucle si el escritorio rechaza.
+ * Conecta la sincronización con un escritorio vinculado y presente, si todavía no
+ * hay una sesión —ni conectada ni en curso—. Es idempotente: llamarla de más no
+ * abre sesiones de más. La reconexión tras una caída la dispara el próximo
+ * `peers-changed` (los anuncios mDNS son frecuentes): así reconecta pronto sin un
+ * reintento inmediato, que haría un bucle si el escritorio rechaza la conexión.
  */
 function ensureSync(peer: Peer): void {
 	const id = peer.device_id;
-	if (!pairedIds.value.has(id)) {
-		return;
-	}
-	if (connecting.has(id)) {
-		pendingReconnect.add(id);
+	if (!pairedIds.value.has(id) || connecting.has(id) || connected.value.includes(id)) {
 		return;
 	}
 	connecting.add(id);
 	invoke('sync_connect', { deviceId: id })
 		.catch((error) => console.error('La sesión de sincronización terminó', error))
-		.finally(() => {
-			connecting.delete(id);
-			if (pendingReconnect.delete(id)) {
-				const presente = peers.value.find((p) => p.device_id === id);
-				if (presente !== undefined) {
-					ensureSync(presente);
-				}
-			}
-		});
+		.finally(() => connecting.delete(id));
 }
 
-/** Los `device_id` presentes en la última lista de descubiertos, para distinguir
- * los que REAPARECEN de los que sólo siguen ahí. */
-const seenIds = new Set<string>();
-
-/**
- * Sincroniza con los escritorios que **acaban de aparecer** (no estaban en la lista
- * anterior). `peers-changed` trae la lista entera, así que llamar a `ensureSync`
- * para todos marcaría a uno conectado para reintento cada vez que cambia otro; sólo
- * los que reaparecen disparan la sincronización (y, si reaparecen durante un intento
- * en vuelo, su reconexión).
- */
-function syncAppeared(): void {
+/** Intenta sincronizar con cada escritorio descubierto que esté vinculado. */
+function syncDiscoveredPaired(): void {
 	for (const peer of peers.value) {
-		if (!seenIds.has(peer.device_id)) {
-			ensureSync(peer);
-		}
-	}
-	seenIds.clear();
-	for (const peer of peers.value) {
-		seenIds.add(peer.device_id);
+		ensureSync(peer);
 	}
 }
 
@@ -164,7 +132,7 @@ onMounted(async () => {
 		await escuchar<Peer[]>('peers-changed', (payload) => {
 			peers.value = payload ?? [];
 			// Apenas aparece un escritorio, si está vinculado se intenta sincronizar.
-			syncAppeared();
+			syncDiscoveredPaired();
 		});
 		await escuchar<string>('pairing-sas', (payload) => {
 			if (pairing.value !== null) {
@@ -178,8 +146,8 @@ onMounted(async () => {
 				const id = payload.device_id;
 				refreshPaired()
 					.then(() => {
-						// El escritorio recién vinculado ya estaba descubierto, así que
-						// `syncAppeared` no lo tomaría (no es «nuevo»): se conecta directo.
+						// El escritorio recién vinculado: se conecta en el acto, sin esperar
+						// al próximo `peers-changed`.
 						const peer = peers.value.find((p) => p.device_id === id);
 						if (peer !== undefined) {
 							ensureSync(peer);
@@ -204,7 +172,7 @@ onMounted(async () => {
 
 		peers.value = (await invoke<Peer[]>('discovered_peers')) ?? [];
 		await refreshPaired();
-		syncAppeared();
+		syncDiscoveredPaired();
 	} catch (error) {
 		console.error('No se pudo iniciar el descubrimiento', error);
 		// Si el arranque falló a mitad, soltar los oyentes que sí se registraron:
