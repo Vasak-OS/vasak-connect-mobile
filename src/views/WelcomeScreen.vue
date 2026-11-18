@@ -97,10 +97,42 @@ async function confirm(accept: boolean): Promise<void> {
 	}
 }
 
+/** Los `device_id` con sesión de sincronización viva (del evento `sync-status`). */
+const connected = ref<string[]>([]);
+/** Los pareos para los que ya hay un `sync_connect` en vuelo, para no lanzar dos. */
+const connecting = new Set<string>();
+
+/**
+ * Conecta la sincronización con un escritorio vinculado y presente, si todavía no
+ * hay una sesión —ni conectada ni en curso—. Es idempotente: llamarla de más no
+ * abre sesiones de más. La reconexión tras una caída la dispara el próximo
+ * `peers-changed` (los anuncios mDNS son frecuentes): así reconecta pronto sin un
+ * reintento inmediato, que haría un bucle si el escritorio rechaza la conexión.
+ */
+function ensureSync(peer: Peer): void {
+	const id = peer.device_id;
+	if (!pairedIds.value.has(id) || connecting.has(id) || connected.value.includes(id)) {
+		return;
+	}
+	connecting.add(id);
+	invoke('sync_connect', { deviceId: id })
+		.catch((error) => console.error('La sesión de sincronización terminó', error))
+		.finally(() => connecting.delete(id));
+}
+
+/** Intenta sincronizar con cada escritorio descubierto que esté vinculado. */
+function syncDiscoveredPaired(): void {
+	for (const peer of peers.value) {
+		ensureSync(peer);
+	}
+}
+
 onMounted(async () => {
 	try {
 		await escuchar<Peer[]>('peers-changed', (payload) => {
 			peers.value = payload ?? [];
+			// Apenas aparece un escritorio, si está vinculado se intenta sincronizar.
+			syncDiscoveredPaired();
 		});
 		await escuchar<string>('pairing-sas', (payload) => {
 			if (pairing.value !== null) {
@@ -111,10 +143,22 @@ onMounted(async () => {
 			pairing.value = null;
 			result.value = payload;
 			if (payload.status === 'paired') {
-				refreshPaired().catch((error) =>
-					console.error('No se pudo refrescar los vinculados', error)
-				);
+				const id = payload.device_id;
+				refreshPaired()
+					.then(() => {
+						// El escritorio recién vinculado: se conecta en el acto, sin esperar
+						// al próximo `peers-changed`.
+						const peer = peers.value.find((p) => p.device_id === id);
+						if (peer !== undefined) {
+							ensureSync(peer);
+						}
+					})
+					.catch((error) => console.error('No se pudo refrescar los vinculados', error));
 			}
+		});
+		await escuchar<{ device_id: string; connected: boolean }>('sync-status', (payload) => {
+			const resto = connected.value.filter((id) => id !== payload.device_id);
+			connected.value = payload.connected ? [...resto, payload.device_id] : resto;
 		});
 		if (disposed) {
 			return;
@@ -128,6 +172,7 @@ onMounted(async () => {
 
 		peers.value = (await invoke<Peer[]>('discovered_peers')) ?? [];
 		await refreshPaired();
+		syncDiscoveredPaired();
 	} catch (error) {
 		console.error('No se pudo iniciar el descubrimiento', error);
 		// Si el arranque falló a mitad, soltar los oyentes que sí se registraron:
@@ -202,7 +247,9 @@ onUnmounted(() => {
           <span
             v-if="pairedIds.has(peer.device_id)"
             class="shrink-0 text-sm text-status-success">
-            {{ t('inicio.descubiertos.vinculado') }}
+            {{ connected.includes(peer.device_id)
+              ? t('inicio.descubiertos.conectado')
+              : t('inicio.descubiertos.vinculado') }}
           </span>
           <button
             v-else

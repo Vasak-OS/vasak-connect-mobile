@@ -17,6 +17,7 @@ mod discovery;
 mod identity;
 mod pairing;
 mod store;
+mod sync;
 mod transport;
 
 use std::collections::HashMap;
@@ -51,6 +52,10 @@ const PAIRING_SAS: &str = "pairing-sas";
 
 /// Cómo terminó un pareo. La interfaz lo escucha para cerrar el diálogo del SAS.
 const PAIRING_RESULT: &str = "pairing-result";
+
+/// Cambió el estado de la sesión de sincronización con un escritorio (conectada o
+/// no). La interfaz lo muestra como «Conectado».
+const SYNC_STATUS: &str = "sync-status";
 
 /// Estado del canal, administrado por Tauri. El `Mutex` alcanza: las operaciones
 /// son cortas (tomar el candado, mutar el mapa, soltar) y no hay `.await` adentro.

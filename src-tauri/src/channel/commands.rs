@@ -21,14 +21,18 @@ use super::identity::{self, Identity};
 use super::store::{self, PairedPeer};
 use super::transport::{self, Session, SessionError};
 use super::{
-    apply_event, pairing, snapshot, ChannelState, PAIRING_RESULT, PAIRING_SAS, PEERS_CHANGED,
-    SELF_NAME,
+    apply_event, pairing, snapshot, sync, ChannelState, PAIRING_RESULT, PAIRING_SAS, PEERS_CHANGED,
+    SELF_NAME, SYNC_STATUS,
 };
 
 /// Cuánto se le da a un pareo antes de cortarlo. Un escritorio que acepta el TCP
 /// pero nunca completa el TLS —o se queda callado— no puede bloquear para siempre:
 /// sin esto `pairing_active` quedaría tomado y todo pareo posterior fallaría.
 const PAIRING_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Tope para abrir el TCP + TLS al reconectar para sincronizar. Separado de la vida
+/// de la sesión: acota sólo el establecimiento, no la sesión ya viva.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ── Descubrimiento ───────────────────────────────────────────────────────────
 
@@ -371,6 +375,89 @@ async fn paired_peers(app: AppHandle) -> Result<Vec<PairedPeer>, String> {
     Ok(store::load(&dir).await)
 }
 
+/// Lo que viaja en el evento [`SYNC_STATUS`].
+#[derive(Clone, Serialize)]
+struct SyncStatusPayload {
+    device_id: String,
+    connected: bool,
+}
+
+/// Conecta con un escritorio **ya pareado y descubierto** y mantiene viva la sesión
+/// (keepalive) hasta que se cae. Es un comando de larga duración: su promesa queda
+/// pendiente mientras la sesión está viva y se resuelve al cortarse, así la interfaz
+/// sabe cuándo reconectar sin que el backend administre tareas ni estado.
+#[tauri::command]
+async fn sync_connect(
+    app: AppHandle,
+    state: State<'_, ChannelState>,
+    device_id: String,
+) -> Result<(), String> {
+    let addr = {
+        let inner = state.inner.lock().map_err(|_| "estado envenenado")?;
+        inner.peers.get(&device_id).map(|d| d.addr)
+    }
+    .ok_or("ese escritorio ya no está en la lista")?;
+
+    let dir = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
+    let pinned = store::load(&dir)
+        .await
+        .into_iter()
+        .find(|p| p.device_id == device_id)
+        .map(|p| p.fingerprint)
+        .ok_or("ese escritorio no está vinculado")?;
+
+    let identity = identity_for(&app, &state).await?;
+    let own = PeerInfo {
+        device_id: identity.device_id.clone(),
+        name: SELF_NAME.to_string(),
+        kind: DeviceKind::Phone,
+        protocol_version: PROTOCOL_VERSION,
+        fingerprint: identity.fingerprint.clone(),
+    };
+
+    // Con tope de tiempo: un escritorio que acepta el TCP pero no completa el TLS no
+    // puede dejar el intento colgado (ni a la interfaz esperándolo).
+    let session =
+        match tokio::time::timeout(CONNECT_TIMEOUT, Session::connect(addr, &identity)).await {
+            Ok(result) => result.map_err(|e| e.to_string())?,
+            Err(_) => return Err("el escritorio no respondió al conectar".to_string()),
+        };
+    let peer_fingerprint = session.peer_fingerprint().to_string();
+    let (read_half, write_half) = session.split();
+    let (in_tx, mut in_rx) = mpsc::channel::<Result<Message, SessionError>>(16);
+    let (out_tx, out_rx) = mpsc::channel::<Message>(16);
+    // El guard aborta las tareas al volver (termine o falle la sesión), igual que en
+    // el pareo: nada queda colgado leyendo de un escritorio callado.
+    let _workers = AbortWorkers(
+        tauri::async_runtime::spawn(transport::reader_loop(read_half, in_tx)),
+        tauri::async_runtime::spawn(transport::writer_loop(write_half, out_rx)),
+    );
+
+    // Establecer la sesión (pinning + Hello, con tope de tiempo). Si falla, se vuelve
+    // sin avisar «conectado»: la interfaz no muestra un estado falso.
+    sync::handshake(&peer_fingerprint, &pinned, &own, &mut in_rx, &out_tx)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // Recién con la sesión establecida se avisa «conectado».
+    let _ = app.emit(
+        SYNC_STATUS,
+        SyncStatusPayload {
+            device_id: device_id.clone(),
+            connected: true,
+        },
+    );
+    let result = sync::run_loop(&mut in_rx, &out_tx).await;
+    let _ = app.emit(
+        SYNC_STATUS,
+        SyncStatusPayload {
+            device_id,
+            connected: false,
+        },
+    );
+    result.map_err(|e| e.to_string())
+}
+
 /// Registra el estado del canal y sus comandos en el `Builder`.
 ///
 /// Concreto a `Wry` a propósito: `generate_handler!` resuelve `AppHandle`
@@ -385,6 +472,7 @@ pub fn init(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wry> {
             discovered_peers,
             pair_request,
             pair_confirm,
-            paired_peers
+            paired_peers,
+            sync_connect
         ])
 }
